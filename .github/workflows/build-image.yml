@@ -20,7 +20,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/gobii-ai/gobii-sandbox-compute-server
+  IMAGE_NAME: ghcr.io/gobii-ai/gobii-sandbox-compute
 
 jobs:
   build-image:
@@ -55,8 +55,8 @@ jobs:
             ${{ env.IMAGE_NAME }}:main
           build-args: |
             GIT_COMMIT=${{ github.sha }}
-          cache-from: type=gha,scope=gobii-sandbox-compute-server
-          cache-to: type=gha,mode=max,scope=gobii-sandbox-compute-server
+          cache-from: type=gha,scope=gobii-sandbox-compute
+          cache-to: type=gha,mode=max,scope=gobii-sandbox-compute
           platforms: linux/amd64
           provenance: false
           sbom: false
