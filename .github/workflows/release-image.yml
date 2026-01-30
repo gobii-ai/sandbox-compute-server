@@ -113,6 +113,11 @@ jobs:
           print(f"Bumped version to {new_version}")
           PY
 
+      - name: Normalize version
+        run: |
+          CLEAN_VERSION="$(printf '%s' "$NEW_VERSION" | tr -d '\r\n')"
+          echo "NEW_VERSION=$CLEAN_VERSION" >> "$GITHUB_ENV"
+
       - name: Commit version bump
         run: |
           git config user.name "github-actions[bot]"
