@@ -978,12 +978,12 @@ def _normalize_mcp_result(result: Any) -> Any:
         try:
             return result.model_dump()
         except Exception:
-            pass
+            logger.debug("Failed to serialize MCP result via model_dump()", exc_info=True)
     if hasattr(result, "dict"):
         try:
             return result.dict()
         except Exception:
-            pass
+            logger.debug("Failed to serialize MCP result via dict()", exc_info=True)
     if hasattr(result, "__dict__"):
         return result.__dict__
     return str(result)
@@ -1044,21 +1044,6 @@ async def _discover_mcp_tools(runtime: Dict[str, Any]) -> list[Dict[str, Any]]:
     return serialized
 
 
-def _run_async(coro: Any) -> Any:
-    loop = None
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(coro)
-    finally:
-        if loop is not None:
-            try:
-                loop.close()
-            except Exception:
-                pass
-        asyncio.set_event_loop(None)
-
-
 def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     agent_id, error = _require_agent_id(payload)
     if error:
@@ -1079,7 +1064,7 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
 
     try:
-        result = _run_async(_call_mcp_tool(runtime, tool_name.strip(), params))
+        result = asyncio.run(_call_mcp_tool(runtime, tool_name.strip(), params))
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -1091,7 +1076,7 @@ def _handle_discover_mcp_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
     if runtime_error:
         return runtime_error
     try:
-        tools = _run_async(_discover_mcp_tools(runtime))
+        tools = asyncio.run(_discover_mcp_tools(runtime))
     except Exception as exc:
         logger.exception("MCP tool discovery failed")
         return {"status": "error", "message": str(exc)}
