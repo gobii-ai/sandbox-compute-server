@@ -94,7 +94,7 @@ jobs:
               sys.exit(1)
 
           new_version = f"{major}.{minor}.{patch}"
-          pattern = r'(?m)^(version\\s*=\\s*")' + re.escape(version.strip()) + r'("\\s*(#.*)?)$'
+          pattern = r'(?m)^(version\s*=\s*")' + re.escape(version.strip()) + r'("\s*(#.*)?)$'
           def _replace(match: re.Match) -> str:
               return f'{match.group(1)}{new_version}{match.group(2)}'
 
