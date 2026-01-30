@@ -1093,6 +1093,7 @@ def _handle_discover_mcp_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         tools = _run_async(_discover_mcp_tools(runtime))
     except Exception as exc:
+        logger.exception("MCP tool discovery failed")
         return {"status": "error", "message": str(exc)}
 
     return {
