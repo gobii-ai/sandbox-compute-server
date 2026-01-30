@@ -43,6 +43,9 @@ _DEFAULT_ALLOWED_ENV_KEYS = {
 }
 
 _PROXY_ENV_KEYS = {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
+_TRACEPARENT_HEADER = "HTTP_TRACEPARENT"
+_TRACE_ID_HEX_LEN = 32
+_TRACEPARENT_PARTS = 4
 
 
 def _allowed_env_keys() -> set[str]:
@@ -332,6 +335,34 @@ def _truncate_streams(stdout: str, stderr: str) -> Tuple[str, str]:
     )
 
 
+def _extract_traceparent(environ: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    raw = environ.get(_TRACEPARENT_HEADER)
+    if not isinstance(raw, str) or not raw.strip():
+        return None, None
+    traceparent = raw.strip()
+    parts = traceparent.split("-")
+    if len(parts) < _TRACEPARENT_PARTS:
+        return traceparent, None
+    trace_id = parts[1].lower()
+    if len(trace_id) != _TRACE_ID_HEX_LEN or any(ch not in "0123456789abcdef" for ch in trace_id):
+        return traceparent, None
+    if trace_id == "0" * _TRACE_ID_HEX_LEN:
+        return traceparent, None
+    return traceparent, trace_id
+
+
+def _trace_context(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    trace_id = payload.get("_trace_id")
+    traceparent = payload.get("_traceparent")
+    if not isinstance(trace_id, str):
+        trace_id = None
+    if not isinstance(traceparent, str):
+        traceparent = None
+    return trace_id, traceparent
+
+
+
+
 def _get_bearer_token(environ: Dict[str, Any]) -> Optional[str]:
     auth = environ.get("HTTP_AUTHORIZATION", "")
     if not auth:
@@ -391,6 +422,7 @@ def _handle_deploy_or_resume(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_run_command(payload: Dict[str, Any]) -> Dict[str, Any]:
+    start = time.time()
     agent_id, error = _require_agent_id(payload)
     if error:
         return error
@@ -426,20 +458,55 @@ def _handle_run_command(payload: Dict[str, Any]) -> Dict[str, Any]:
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        logger.exception(
+            "Sandbox run_command timed out agent=%s command=%s cwd=%s duration_ms=%s trace_id=%s",
+            agent_id,
+            command,
+            cwd,
+            duration_ms,
+            trace_id,
+        )
         return {"status": "error", "message": "Command timed out."}
     except OSError as exc:
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        logger.exception(
+            "Sandbox run_command failed to start agent=%s command=%s cwd=%s duration_ms=%s trace_id=%s",
+            agent_id,
+            command,
+            cwd,
+            duration_ms,
+            trace_id,
+        )
         return {"status": "error", "message": f"Command failed to start: {exc}"}
 
     stdout, stderr = _truncate_streams(result.stdout or "", result.stderr or "")
-    return {
+    response = {
         "status": "ok" if result.returncode == 0 else "error",
         "exit_code": result.returncode,
         "stdout": stdout,
         "stderr": stderr,
     }
+    duration_ms = int((time.time() - start) * 1000)
+    trace_id, _traceparent = _trace_context(payload)
+    logger.info(
+        "Sandbox run_command agent=%s command=%s cwd=%s status=%s exit_code=%s duration_ms=%s trace_id=%s result=%s",
+        agent_id,
+        command,
+        cwd,
+        response.get("status"),
+        response.get("exit_code"),
+        duration_ms,
+        trace_id,
+        json.dumps(response, sort_keys=True, ensure_ascii=True),
+    )
+    return response
 
 
 def _handle_python_exec(payload: Dict[str, Any]) -> Dict[str, Any]:
+    start = time.time()
     agent_id, error = _require_agent_id(payload)
     if error:
         return error
@@ -463,17 +530,34 @@ def _handle_python_exec(payload: Dict[str, Any]) -> Dict[str, Any]:
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        logger.exception(
+            "Sandbox python_exec timed out agent=%s duration_ms=%s trace_id=%s",
+            agent_id,
+            duration_ms,
+            trace_id,
+        )
         return {"status": "error", "message": "Python execution timed out."}
     except OSError as exc:
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        logger.exception(
+            "Sandbox python_exec failed to start agent=%s duration_ms=%s trace_id=%s",
+            agent_id,
+            duration_ms,
+            trace_id,
+        )
         return {"status": "error", "message": f"Python execution failed to start: {exc}"}
 
     stdout, stderr = _truncate_streams(result.stdout or "", result.stderr or "")
-    return {
+    response = {
         "status": "ok" if result.returncode == 0 else "error",
         "exit_code": result.returncode,
         "stdout": stdout,
         "stderr": stderr,
     }
+    return response
 
 
 def _write_file(agent_root: Path, rel_path: str, content: bytes, overwrite: bool) -> Optional[Dict[str, Any]]:
@@ -499,6 +583,7 @@ def _write_file(agent_root: Path, rel_path: str, content: bytes, overwrite: bool
         with open(full_path, "wb") as handle:
             handle.write(content)
     except OSError as exc:
+        logger.exception("Failed to write file to workspace path=%s", normalized or rel_path)
         return {"status": "error", "message": f"Failed to write file: {exc}"}
     return {"status": "ok", "export_path": normalized}
 
@@ -608,6 +693,7 @@ def _handle_create_pdf(agent_root: Path, payload: Dict[str, Any]) -> Dict[str, A
 
 
 def _handle_tool_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    start = time.time()
     agent_id, error = _require_agent_id(payload)
     if error:
         return error
@@ -621,19 +707,79 @@ def _handle_tool_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     if tool_name == "python_exec":
         params = dict(params)
         params["agent_id"] = agent_id
-        return _handle_python_exec(params)
+        response = _handle_python_exec(params)
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        logger.info(
+            "Sandbox tool_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
+            agent_id,
+            tool_name,
+            response.get("status"),
+            duration_ms,
+            trace_id,
+            json.dumps(response, sort_keys=True, ensure_ascii=True),
+        )
+        return response
     if tool_name == "create_file":
-        return _handle_create_file(agent_root, params)
+        response = _handle_create_file(agent_root, params)
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        logger.info(
+            "Sandbox tool_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
+            agent_id,
+            tool_name,
+            response.get("status"),
+            duration_ms,
+            trace_id,
+            json.dumps(response, sort_keys=True, ensure_ascii=True),
+        )
+        return response
     if tool_name == "create_csv":
-        return _handle_create_csv(agent_root, params)
+        response = _handle_create_csv(agent_root, params)
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        logger.info(
+            "Sandbox tool_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
+            agent_id,
+            tool_name,
+            response.get("status"),
+            duration_ms,
+            trace_id,
+            json.dumps(response, sort_keys=True, ensure_ascii=True),
+        )
+        return response
     if tool_name == "create_pdf":
-        return _handle_create_pdf(agent_root, params)
+        response = _handle_create_pdf(agent_root, params)
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        logger.info(
+            "Sandbox tool_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
+            agent_id,
+            tool_name,
+            response.get("status"),
+            duration_ms,
+            trace_id,
+            json.dumps(response, sort_keys=True, ensure_ascii=True),
+        )
+        return response
 
-    return {
+    response = {
         "status": "error",
         "error_code": "sandbox_unsupported_tool",
         "message": f"Sandbox tool '{tool_name}' is not supported yet.",
     }
+    duration_ms = int((time.time() - start) * 1000)
+    trace_id, _traceparent = _trace_context(payload)
+    logger.info(
+        "Sandbox tool_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
+        agent_id,
+        tool_name,
+        response.get("status"),
+        duration_ms,
+        trace_id,
+        json.dumps(response, sort_keys=True, ensure_ascii=True),
+    )
+    return response
 
 
 def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -767,6 +913,7 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
                 with open(full_path, "wb") as handle:
                     handle.write(content)
             except OSError as exc:
+                logger.exception("Failed to write synced file agent=%s path=%s", agent_id, normalized)
                 return {"status": "error", "message": f"Failed to write {normalized}: {exc}"}
             manifest["files"][normalized] = {
                 "mtime": full_path.stat().st_mtime,
@@ -811,6 +958,7 @@ def _download_file(url: str, expected_size: Optional[int], proxy_env: Optional[D
                     raise RuntimeError("Downloaded file exceeds workspace size limit.")
             return bytes(data)
     except requests.RequestException as exc:
+        logger.exception("Sandbox download failed url=%s", url)
         raise RuntimeError(f"Failed to download file: {exc}") from exc
 
 
@@ -1045,6 +1193,7 @@ async def _discover_mcp_tools(runtime: Dict[str, Any]) -> list[Dict[str, Any]]:
 
 
 def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    start = time.time()
     agent_id, error = _require_agent_id(payload)
     if error:
         return error
@@ -1066,9 +1215,40 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         result = asyncio.run(_call_mcp_tool(runtime, tool_name.strip(), params))
     except Exception as exc:
-        return {"status": "error", "message": str(exc)}
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        logger.exception(
+            "Sandbox mcp_request failed agent=%s tool=%s duration_ms=%s trace_id=%s",
+            agent_id,
+            tool_name,
+            duration_ms,
+            trace_id,
+        )
+        response = {"status": "error", "message": str(exc)}
+        logger.info(
+            "Sandbox mcp_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
+            agent_id,
+            tool_name,
+            response.get("status"),
+            duration_ms,
+            trace_id,
+            json.dumps(response, sort_keys=True, ensure_ascii=True),
+        )
+        return response
 
-    return {"status": "ok", "result": _normalize_mcp_result(result)}
+    response = {"status": "ok", "result": _normalize_mcp_result(result)}
+    duration_ms = int((time.time() - start) * 1000)
+    trace_id, _traceparent = _trace_context(payload)
+    logger.info(
+        "Sandbox mcp_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
+        agent_id,
+        tool_name,
+        response.get("status"),
+        duration_ms,
+        trace_id,
+        json.dumps(response, sort_keys=True, ensure_ascii=True),
+    )
+    return response
 
 
 def _handle_discover_mcp_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1118,6 +1298,11 @@ def application(environ: Dict[str, Any], start_response: Callable) -> list[bytes
         return _json_response(start_response, "400 Bad Request", parse_error)
     if payload is None:
         return _json_response(start_response, "400 Bad Request", {"status": "error", "message": "Invalid request."})
+    traceparent, trace_id = _extract_traceparent(environ)
+    if traceparent:
+        payload["_traceparent"] = traceparent
+    if trace_id:
+        payload["_trace_id"] = trace_id
 
     handler = _ROUTES.get(path.rstrip("/"))
     if not handler:
