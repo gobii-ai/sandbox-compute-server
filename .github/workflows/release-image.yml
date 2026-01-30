@@ -55,14 +55,27 @@ jobs:
           import os
           import re
           import sys
+          import tomllib
 
           bump = os.environ["BUMP"]
           path = "pyproject.toml"
           text = open(path, "r", encoding="utf-8").read()
-          match = re.search(r'^version\\s*=\\s*"(?P<maj>\\d+)\\.(?P<min>\\d+)\\.(?P<pat>\\d+)"\\s*$', text, re.M)
-          if not match:
-              print("Version not found in pyproject.toml", file=sys.stderr)
+          try:
+              data = tomllib.loads(text)
+          except tomllib.TOMLDecodeError as exc:
+              print(f"Invalid pyproject.toml: {exc}", file=sys.stderr)
               sys.exit(1)
+
+          version = (data.get("project") or {}).get("version")
+          if not isinstance(version, str) or not version.strip():
+              print("Version not found in pyproject.toml [project].version", file=sys.stderr)
+              sys.exit(1)
+
+          match = re.match(r'^(?P<maj>\\d+)\\.(?P<min>\\d+)\\.(?P<pat>\\d+)$', version.strip())
+          if not match:
+              print(f"Unsupported version format: {version}", file=sys.stderr)
+              sys.exit(1)
+
           major = int(match.group("maj"))
           minor = int(match.group("min"))
           patch = int(match.group("pat"))
@@ -81,15 +94,15 @@ jobs:
               sys.exit(1)
 
           new_version = f"{major}.{minor}.{patch}"
-          updated = re.sub(
-              r'^version\\s*=\\s*"[0-9]+\\.[0-9]+\\.[0-9]+"\\s*$',
-              f'version = "{new_version}"',
+          pattern = r'(?m)^(version\\s*=\\s*")' + re.escape(version.strip()) + r'("\\s*(#.*)?)$'
+          updated, count = re.subn(
+              pattern,
+              f'\\1{new_version}\\2',
               text,
               count=1,
-              flags=re.M,
           )
           if updated == text:
-              print("Version update failed", file=sys.stderr)
+              print("Version update failed: version line not replaced", file=sys.stderr)
               sys.exit(1)
           open(path, "w", encoding="utf-8").write(updated)
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
