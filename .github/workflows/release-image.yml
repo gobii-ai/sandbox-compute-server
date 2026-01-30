@@ -108,18 +108,14 @@ jobs:
               print("Version update failed: version line not replaced", file=sys.stderr)
               sys.exit(1)
           open(path, "w", encoding="utf-8").write(updated)
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
-              env.write(f"NEW_VERSION={new_version}\\n")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8", newline="\n") as env:
+              env.write(f"NEW_VERSION={new_version}\n")
           print(f"Bumped version to {new_version}")
           PY
 
-      - name: Normalize version
-        run: |
-          CLEAN_VERSION="$(printf '%s' "$NEW_VERSION" | tr -d '\r\n')"
-          echo "NEW_VERSION=$CLEAN_VERSION" >> "$GITHUB_ENV"
-
       - name: Commit version bump
         run: |
+          NEW_VERSION="$(printf '%s' "$NEW_VERSION" | tr -d '\r\n')"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add pyproject.toml
@@ -135,6 +131,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          NEW_VERSION="$(printf '%s' "$NEW_VERSION" | tr -d '\r\n')"
           gh api "repos/${{ github.repository }}/releases/generate-notes" \
             -f tag_name="${NEW_VERSION}" \
             --jq .body > release-notes-auto.md
@@ -210,6 +207,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          NEW_VERSION="$(printf '%s' "$NEW_VERSION" | tr -d '\r\n')"
           gh release create "${NEW_VERSION}" \
             --title "${NEW_VERSION}" \
             --notes-file release-notes.md
