@@ -15,6 +15,10 @@ on:
         description: Patch notes
         type: string
         required: false
+      title:
+        description: Release title
+        type: string
+        required: false
 
 concurrency:
   group: sandbox-compute-server-release
@@ -107,48 +111,12 @@ jobs:
           git push origin --tags
 
       - name: Generate release notes
-        id: release_notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          TAG: ${{ env.NEW_VERSION }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          import sys
-          import urllib.request
-
-          token = os.environ["GH_TOKEN"]
-          repo = os.environ["REPO"]
-          tag = os.environ["TAG"]
-          url = f"https://api.github.com/repos/{repo}/releases/generate-notes"
-          payload = json.dumps({"tag_name": tag}).encode("utf-8")
-
-          req = urllib.request.Request(
-              url,
-              data=payload,
-              method="POST",
-              headers={
-                  "Authorization": f"Bearer {token}",
-                  "Accept": "application/vnd.github+json",
-                  "User-Agent": "sandbox-compute-release",
-              },
-          )
-          try:
-              with urllib.request.urlopen(req) as resp:
-                  data = json.load(resp)
-          except Exception as exc:
-              print(f"Failed to generate release notes: {exc}", file=sys.stderr)
-              sys.exit(1)
-
-          body = data.get("body", "").strip()
-          out_path = os.environ["GITHUB_OUTPUT"]
-          with open(out_path, "a", encoding="utf-8") as out:
-              out.write("notes<<'EOF'\\n")
-              out.write(body + "\\n")
-              out.write("EOF\\n")
-          PY
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${NEW_VERSION}" \
+            --jq .body > release-notes-auto.md
 
       - name: Set release SHAs
         run: |
@@ -184,12 +152,43 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.NEW_VERSION }}
-          name: ${{ env.NEW_VERSION }}
-          body: |
-            ${{ inputs.notes }}
+      - name: Assemble release notes file
+        env:
+          NOTES: ${{ inputs.notes }}
+          TITLE: ${{ inputs.title }}
+          VERSION: ${{ env.NEW_VERSION }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
 
-            ${{ steps.release_notes.outputs.notes }}
+          version = os.environ.get("VERSION", "").strip()
+          title = os.environ.get("TITLE", "").strip()
+          notes = os.environ.get("NOTES", "").strip()
+
+          parts = []
+          if version:
+            header = f"## {version}" + (f" - {title}" if title else "")
+            parts.append(header)
+          if notes:
+            parts.extend(["", notes])
+
+          auto_path = Path("release-notes-auto.md")
+          if auto_path.exists():
+            auto_notes = auto_path.read_text(encoding="utf-8").strip()
+            if auto_notes:
+              parts.extend(["", auto_notes])
+
+          content = "\n".join(part for part in parts if part is not None).lstrip()
+          if content and not content.endswith("\n"):
+            content += "\n"
+          Path("release-notes.md").write_text(content, encoding="utf-8")
+          PY
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${NEW_VERSION}" \
+            --title "${NEW_VERSION}" \
+            --notes-file release-notes.md
