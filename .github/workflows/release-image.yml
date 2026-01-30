@@ -71,7 +71,7 @@ jobs:
               print("Version not found in pyproject.toml [project].version", file=sys.stderr)
               sys.exit(1)
 
-          match = re.match(r'^(?P<maj>\\d+)\\.(?P<min>\\d+)\\.(?P<pat>\\d+)$', version.strip())
+          match = re.match(r'^(?P<maj>\d+)\.(?P<min>\d+)\.(?P<pat>\d+)$', version.strip())
           if not match:
               print(f"Unsupported version format: {version}", file=sys.stderr)
               sys.exit(1)
