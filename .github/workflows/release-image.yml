@@ -1,0 +1,195 @@
+name: Release Sandbox Compute Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+        required: true
+      notes:
+        description: Patch notes
+        type: string
+        required: false
+
+concurrency:
+  group: sandbox-compute-server-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/gobii-ai/gobii-sandbox-compute
+
+jobs:
+  release:
+    name: Release Sandbox Compute Server Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Bump version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+
+          bump = os.environ["BUMP"]
+          path = "pyproject.toml"
+          text = open(path, "r", encoding="utf-8").read()
+          match = re.search(r'^version\\s*=\\s*"(?P<maj>\\d+)\\.(?P<min>\\d+)\\.(?P<pat>\\d+)"\\s*$', text, re.M)
+          if not match:
+              print("Version not found in pyproject.toml", file=sys.stderr)
+              sys.exit(1)
+          major = int(match.group("maj"))
+          minor = int(match.group("min"))
+          patch = int(match.group("pat"))
+
+          if bump == "major":
+              major += 1
+              minor = 0
+              patch = 0
+          elif bump == "minor":
+              minor += 1
+              patch = 0
+          elif bump == "patch":
+              patch += 1
+          else:
+              print(f"Unsupported bump: {bump}", file=sys.stderr)
+              sys.exit(1)
+
+          new_version = f"{major}.{minor}.{patch}"
+          updated = re.sub(
+              r'^version\\s*=\\s*"[0-9]+\\.[0-9]+\\.[0-9]+"\\s*$',
+              f'version = "{new_version}"',
+              text,
+              count=1,
+              flags=re.M,
+          )
+          if updated == text:
+              print("Version update failed", file=sys.stderr)
+              sys.exit(1)
+          open(path, "w", encoding="utf-8").write(updated)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"NEW_VERSION={new_version}\\n")
+          print(f"Bumped version to {new_version}")
+          PY
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "chore(release): ${NEW_VERSION}"
+          git tag -a "${NEW_VERSION}" -m "Release ${NEW_VERSION}"
+
+      - name: Push release commit and tag
+        run: |
+          git push origin HEAD:main
+          git push origin --tags
+
+      - name: Generate release notes
+        id: release_notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ env.NEW_VERSION }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["REPO"]
+          tag = os.environ["TAG"]
+          url = f"https://api.github.com/repos/{repo}/releases/generate-notes"
+          payload = json.dumps({"tag_name": tag}).encode("utf-8")
+
+          req = urllib.request.Request(
+              url,
+              data=payload,
+              method="POST",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "sandbox-compute-release",
+              },
+          )
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  data = json.load(resp)
+          except Exception as exc:
+              print(f"Failed to generate release notes: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          body = data.get("body", "").strip()
+          out_path = os.environ["GITHUB_OUTPUT"]
+          with open(out_path, "a", encoding="utf-8") as out:
+              out.write("notes<<'EOF'\\n")
+              out.write(body + "\\n")
+              out.write("EOF\\n")
+          PY
+
+      - name: Set release SHAs
+        run: |
+          echo "GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push release image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:main
+            ${{ env.IMAGE_NAME }}:${{ env.NEW_VERSION }}
+            ${{ env.IMAGE_NAME }}:sha-${{ env.GIT_SHA }}
+            ${{ env.IMAGE_NAME }}:sha-${{ env.SHORT_SHA }}
+          build-args: |
+            GIT_COMMIT=${{ env.GIT_SHA }}
+          cache-from: type=gha,scope=gobii-sandbox-compute
+          cache-to: type=gha,mode=max,scope=gobii-sandbox-compute
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.NEW_VERSION }}
+          name: ${{ env.NEW_VERSION }}
+          body: |
+            ${{ inputs.notes }}
+
+            ${{ steps.release_notes.outputs.notes }}

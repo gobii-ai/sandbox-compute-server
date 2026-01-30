@@ -5,7 +5,8 @@ on:
     branches: [main]
     paths:
       - "Dockerfile"
-      - "requirements.txt"
+      - "pyproject.toml"
+      - "logging_config.py"
       - "sandbox_compute_server.py"
       - "sandbox_utils.py"
       - ".github/workflows/build-image.yml"
@@ -52,7 +53,6 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
             ${{ env.IMAGE_NAME }}:sha-${{ env.SHORT_SHA }}
-            ${{ env.IMAGE_NAME }}:main
           build-args: |
             GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=gobii-sandbox-compute
