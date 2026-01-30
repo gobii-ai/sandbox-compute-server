@@ -1,0 +1,11 @@
+.env
+__pycache__/
+.ra-aid/
+.ra-msg
+.idea
+.run/
+
+**/.claude/settings.local.json
+
+.DS_Storeplatform/build/
+.DS_Store

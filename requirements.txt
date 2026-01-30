@@ -1,5 +1,0 @@
-requests==2.32.4
-weasyprint>=62.0
-gunicorn==23.0.0
-fastmcp==2.11.3
-mcp==1.13.1

@@ -23,10 +23,11 @@ RUN --mount=type=cache,target=/var/cache/apt \
 
 RUN pip install --upgrade pip
 
-COPY requirements.txt ./
+COPY pyproject.toml README.md ./
+COPY sandbox_compute_server.py sandbox_utils.py logging_config.py ./
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir .
 
 COPY . ./
 

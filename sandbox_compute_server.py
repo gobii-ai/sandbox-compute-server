@@ -20,9 +20,11 @@ from fastmcp.client.transports import StreamableHttpTransport
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from logging_config import configure_logging
 from sandbox_utils import normalize_timeout as _normalize_timeout
 
 logger = logging.getLogger(__name__)
+configure_logging()
 
 _DEFAULT_ALLOWED_ENV_KEYS = {
     "PATH",
