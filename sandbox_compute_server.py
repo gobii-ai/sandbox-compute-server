@@ -614,24 +614,6 @@ def _handle_create_file(agent_root: Path, payload: Dict[str, Any]) -> Dict[str, 
     return response
 
 
-def _handle_create_csv(agent_root: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
-    csv_text = payload.get("csv_text")
-    if not isinstance(csv_text, str) or not csv_text.strip():
-        return {"status": "error", "message": "Missing required parameter: csv_text"}
-    file_path = payload.get("file_path")
-    if not isinstance(file_path, str) or not file_path.strip():
-        return {"status": "error", "message": "Missing required parameter: file_path"}
-    file_path = file_path.strip()
-    if not Path(file_path).suffix:
-        file_path = f"{file_path}.csv"
-    overwrite = payload.get("overwrite") is True
-    response = _write_file(agent_root, file_path, csv_text.encode("utf-8"), overwrite)
-    if response.get("status") != "ok":
-        return response
-    response["mime_type"] = "text/csv"
-    return response
-
-
 def _blocked_html_assets(html: str) -> bool:
     lowered = html.lower()
     return "http://" in lowered or "https://" in lowered or "file://" in lowered
@@ -724,20 +706,6 @@ def _handle_tool_request(payload: Dict[str, Any]) -> Dict[str, Any]:
         return response
     if tool_name == "create_file":
         response = _handle_create_file(agent_root, params)
-        duration_ms = int((time.time() - start) * 1000)
-        trace_id, _traceparent = _trace_context(payload)
-        logger.info(
-            "Sandbox tool_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
-            agent_id,
-            tool_name,
-            response.get("status"),
-            duration_ms,
-            trace_id,
-            json.dumps(response, sort_keys=True, ensure_ascii=True),
-        )
-        return response
-    if tool_name == "create_csv":
-        response = _handle_create_csv(agent_root, params)
         duration_ms = int((time.time() - start) * 1000)
         trace_id, _traceparent = _trace_context(payload)
         logger.info(
