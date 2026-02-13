@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
+from urllib.parse import urlsplit
 
 import requests
 from fastmcp import Client
@@ -185,20 +186,33 @@ def _proxy_env_from_manifest(agent_root: Path) -> Dict[str, str]:
     return filtered
 
 
-def _store_proxy_env(agent_root: Path, payload: Dict[str, Any]) -> None:
+def _store_proxy_env(agent_root: Path, payload: Dict[str, Any]) -> bool:
     proxy_env = payload.get("proxy_env")
     if not isinstance(proxy_env, dict):
-        return
+        return False
     filtered: Dict[str, str] = {}
     for key in _PROXY_ENV_KEYS:
         value = proxy_env.get(key)
         if isinstance(value, str) and value.strip():
             filtered[key] = value.strip()
     if not filtered:
-        return
+        return False
     manifest = _load_manifest(agent_root)
-    manifest["env"] = {**manifest.get("env", {}), **filtered}
+    current_env = manifest.get("env", {})
+    if not isinstance(current_env, dict):
+        current_env = {}
+    next_env = {**current_env, **filtered}
+    if next_env == current_env:
+        return False
+    changed_keys = sorted(key for key in filtered if current_env.get(key) != filtered[key])
+    manifest["env"] = next_env
     _save_manifest(agent_root, manifest)
+    logger.info(
+        "Sandbox proxy env updated workspace=%s changed_keys=%s",
+        str(agent_root),
+        ",".join(changed_keys) if changed_keys else "none",
+    )
+    return True
 
 
 def _parse_since(value: Any) -> Optional[float]:
@@ -363,7 +377,21 @@ def _trace_context(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str
     return trace_id, traceparent
 
 
+def _elapsed_ms(started_at: float) -> int:
+    return int(round((time.monotonic() - started_at) * 1000))
 
+
+def _safe_url_for_log(url: str) -> str:
+    if not isinstance(url, str):
+        return "<invalid-url>"
+    trimmed = url.strip()
+    if not trimmed:
+        return "<empty-url>"
+    parsed = urlsplit(trimmed)
+    if parsed.scheme and parsed.netloc:
+        path = parsed.path or "/"
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+    return trimmed.split("?", 1)[0].split("#", 1)[0]
 
 def _get_bearer_token(environ: Dict[str, Any]) -> Optional[str]:
     auth = environ.get("HTTP_AUTHORIZATION", "")
@@ -415,11 +443,20 @@ def _session_update(state: str) -> Dict[str, Any]:
 
 
 def _handle_deploy_or_resume(payload: Dict[str, Any]) -> Dict[str, Any]:
+    started_at = time.monotonic()
     agent_id, error = _require_agent_id(payload)
     if error:
         return error
     agent_root = _agent_workspace(agent_id)
-    _store_proxy_env(agent_root, payload)
+    proxy_env_updated = _store_proxy_env(agent_root, payload)
+    trace_id, _traceparent = _trace_context(payload)
+    logger.info(
+        "Sandbox deploy_or_resume agent=%s status=ok duration_ms=%s proxy_env_updated=%s trace_id=%s",
+        agent_id,
+        _elapsed_ms(started_at),
+        proxy_env_updated,
+        trace_id,
+    )
     return _session_update("running")
 
 
@@ -753,22 +790,32 @@ def _handle_tool_request(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
+    started_at = time.monotonic()
     agent_id, error = _require_agent_id(payload)
     if error:
         return error
+    trace_id, _traceparent = _trace_context(payload)
     direction = payload.get("direction")
     if not isinstance(direction, str) or not direction.strip():
         return {"status": "error", "message": "Missing required parameter: direction"}
     direction = direction.strip().lower()
     agent_root = _agent_workspace(agent_id)
-    _store_proxy_env(agent_root, payload)
+    proxy_env_updated = _store_proxy_env(agent_root, payload)
+    manifest_load_started = time.monotonic()
     manifest = _load_manifest(agent_root)
+    manifest_load_ms = _elapsed_ms(manifest_load_started)
 
     if direction == "push":
         since = _parse_since(payload.get("since"))
+        scan_started_at = time.monotonic()
         changes: list[Dict[str, Any]] = []
         seen_paths: set[str] = set()
+        scanned_files = 0
+        uploaded_files = 0
+        uploaded_bytes = 0
+        deleted_count = 0
         for path in _iter_workspace_files(agent_root):
+            scanned_files += 1
             rel = "/" + path.relative_to(agent_root).as_posix()
             seen_paths.add(rel)
             try:
@@ -792,6 +839,8 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
             manifest["files"][rel] = {"mtime": mtime, "size": stat.st_size}
             manifest["deleted"].pop(rel, None)
+            uploaded_files += 1
+            uploaded_bytes += len(content)
 
         deleted = manifest.get("deleted", {})
         tracked = set(manifest.get("files", {}).keys())
@@ -802,20 +851,48 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
             changes.append({"path": rel, "is_deleted": True})
             deleted[rel] = {"deleted_at": deleted_at}
             manifest["files"].pop(rel, None)
+            deleted_count += 1
         manifest["deleted"] = deleted
         _save_manifest(agent_root, manifest)
-        return {
+        response = {
             "status": "ok",
             "changes": changes,
             "sync_timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        logger.info(
+            (
+                "Sandbox sync_filespace agent=%s direction=push status=ok "
+                "changes=%s uploaded_files=%s uploaded_bytes=%s deleted=%s scanned_files=%s "
+                "scan_ms=%s manifest_load_ms=%s total_ms=%s since_set=%s proxy_env_updated=%s trace_id=%s"
+            ),
+            agent_id,
+            len(changes),
+            uploaded_files,
+            uploaded_bytes,
+            deleted_count,
+            scanned_files,
+            _elapsed_ms(scan_started_at),
+            manifest_load_ms,
+            _elapsed_ms(started_at),
+            since is not None,
+            proxy_env_updated,
+            trace_id,
+        )
+        return response
 
     if direction == "pull":
         entries = payload.get("files") or payload.get("changes") or []
         if not isinstance(entries, list):
             return {"status": "error", "message": "files must be a list."}
+        pull_started_at = time.monotonic()
         skipped = 0
         conflicts = 0
+        downloaded_files = 0
+        downloaded_bytes = 0
+        download_total_ms = 0
+        inline_content_files = 0
+        deleted_entries = 0
+        proxy_env = _proxy_env_from_manifest(agent_root)
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -826,6 +903,7 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
             entry_updated_at = _parse_entry_updated_at(entry)
             is_deleted = bool(entry.get("is_deleted"))
             if is_deleted:
+                deleted_entries += 1
                 if entry_updated_at is not None and full_path.exists():
                     try:
                         local_mtime = full_path.stat().st_mtime
@@ -847,16 +925,58 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
 
             content = _decode_content(entry)
             if content is None and entry.get("download_url"):
+                download_started_at = time.monotonic()
                 try:
                     content = _download_file(
                         entry["download_url"],
                         entry.get("size_bytes"),
-                        _proxy_env_from_manifest(agent_root),
+                        proxy_env,
                     )
                 except RuntimeError as exc:
-                    return {"status": "error", "message": str(exc)}
+                    message = str(exc)
+                    logger.warning(
+                        (
+                            "Sandbox sync_filespace agent=%s direction=pull status=error "
+                            "message=%s entries=%s skipped=%s conflicts=%s download_ms=%s "
+                            "manifest_load_ms=%s total_ms=%s proxy_env_updated=%s trace_id=%s"
+                        ),
+                        agent_id,
+                        message,
+                        len(entries),
+                        skipped,
+                        conflicts,
+                        download_total_ms,
+                        manifest_load_ms,
+                        _elapsed_ms(started_at),
+                        proxy_env_updated,
+                        trace_id,
+                    )
+                    return {"status": "error", "message": message}
+                downloaded_files += 1
+                downloaded_bytes += len(content)
+                download_total_ms += _elapsed_ms(download_started_at)
+            elif content is not None:
+                inline_content_files += 1
             if content is None:
-                return {"status": "error", "message": f"Missing content for {normalized}"}
+                message = f"Missing content for {normalized}"
+                logger.warning(
+                    (
+                        "Sandbox sync_filespace agent=%s direction=pull status=error "
+                        "message=%s entries=%s skipped=%s conflicts=%s downloaded_files=%s "
+                        "manifest_load_ms=%s total_ms=%s proxy_env_updated=%s trace_id=%s"
+                    ),
+                    agent_id,
+                    message,
+                    len(entries),
+                    skipped,
+                    conflicts,
+                    downloaded_files,
+                    manifest_load_ms,
+                    _elapsed_ms(started_at),
+                    proxy_env_updated,
+                    trace_id,
+                )
+                return {"status": "error", "message": message}
 
             existing_bytes = 0
             if full_path.exists():
@@ -876,6 +996,24 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
 
             capacity_error = _ensure_capacity(agent_root, len(content), existing_bytes=existing_bytes)
             if capacity_error:
+                logger.warning(
+                    (
+                        "Sandbox sync_filespace agent=%s direction=pull status=error "
+                        "message=%s entries=%s skipped=%s conflicts=%s downloaded_files=%s "
+                        "download_ms=%s manifest_load_ms=%s total_ms=%s proxy_env_updated=%s trace_id=%s"
+                    ),
+                    agent_id,
+                    capacity_error.get("message"),
+                    len(entries),
+                    skipped,
+                    conflicts,
+                    downloaded_files,
+                    download_total_ms,
+                    manifest_load_ms,
+                    _elapsed_ms(started_at),
+                    proxy_env_updated,
+                    trace_id,
+                )
                 return capacity_error
 
             full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -893,17 +1031,52 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
             manifest["deleted"].pop(normalized, None)
 
         _save_manifest(agent_root, manifest)
-        return {
+        response = {
             "status": "ok",
             "applied": len(entries) - skipped,
             "skipped": skipped,
             "conflicts": conflicts,
         }
+        logger.info(
+            (
+                "Sandbox sync_filespace agent=%s direction=pull status=ok "
+                "entries=%s applied=%s skipped=%s conflicts=%s deleted_entries=%s "
+                "inline_files=%s downloaded_files=%s downloaded_bytes=%s download_ms=%s "
+                "pull_ms=%s manifest_load_ms=%s total_ms=%s proxy_env_updated=%s trace_id=%s"
+            ),
+            agent_id,
+            len(entries),
+            response.get("applied"),
+            skipped,
+            conflicts,
+            deleted_entries,
+            inline_content_files,
+            downloaded_files,
+            downloaded_bytes,
+            download_total_ms,
+            _elapsed_ms(pull_started_at),
+            manifest_load_ms,
+            _elapsed_ms(started_at),
+            proxy_env_updated,
+            trace_id,
+        )
+        return response
 
-    return {"status": "error", "message": "Invalid sync direction."}
+    message = "Invalid sync direction."
+    logger.warning(
+        "Sandbox sync_filespace agent=%s direction=%s status=error message=%s total_ms=%s trace_id=%s",
+        agent_id,
+        direction,
+        message,
+        _elapsed_ms(started_at),
+        trace_id,
+    )
+    return {"status": "error", "message": message}
 
 
 def _download_file(url: str, expected_size: Optional[int], proxy_env: Optional[Dict[str, str]]) -> bytes:
+    started_at = time.monotonic()
+    safe_url = _safe_url_for_log(url)
     max_bytes = _workspace_max_bytes()
     if expected_size and max_bytes > 0 and expected_size > max_bytes:
         raise RuntimeError("Download exceeds workspace size limit.")
@@ -926,18 +1099,40 @@ def _download_file(url: str, expected_size: Optional[int], proxy_env: Optional[D
                 data.extend(chunk)
                 if max_bytes > 0 and len(data) > max_bytes:
                     raise RuntimeError("Downloaded file exceeds workspace size limit.")
-            return bytes(data)
+            result = bytes(data)
+            logger.info(
+                "Sandbox download_file url=%s status=ok bytes=%s duration_ms=%s via_proxy=%s",
+                safe_url,
+                len(result),
+                _elapsed_ms(started_at),
+                bool(proxies),
+            )
+            return result
     except requests.RequestException as exc:
-        logger.exception("Sandbox download failed url=%s", url)
+        logger.exception(
+            "Sandbox download_file url=%s status=error duration_ms=%s via_proxy=%s",
+            safe_url,
+            _elapsed_ms(started_at),
+            bool(proxies),
+        )
         raise RuntimeError(f"Failed to download file: {exc}") from exc
 
 
 def _handle_terminate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    started_at = time.monotonic()
     agent_id, error = _require_agent_id(payload)
     if error:
         return error
     agent_root = _agent_workspace(agent_id)
-    _store_proxy_env(agent_root, payload)
+    proxy_env_updated = _store_proxy_env(agent_root, payload)
+    trace_id, _traceparent = _trace_context(payload)
+    logger.info(
+        "Sandbox terminate agent=%s status=ok duration_ms=%s proxy_env_updated=%s trace_id=%s",
+        agent_id,
+        _elapsed_ms(started_at),
+        proxy_env_updated,
+        trace_id,
+    )
     return _session_update("stopped")
 
 
@@ -1222,20 +1417,35 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_discover_mcp_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
+    started_at = time.monotonic()
     runtime, runtime_error = _parse_mcp_server_payload(payload)
     if runtime_error:
         return runtime_error
+    trace_id, _traceparent = _trace_context(payload)
     try:
         tools = asyncio.run(_discover_mcp_tools(runtime))
     except Exception as exc:
-        logger.exception("MCP tool discovery failed")
+        logger.exception(
+            "Sandbox discover_mcp_tools failed server_id=%s duration_ms=%s trace_id=%s",
+            runtime.get("config_id"),
+            _elapsed_ms(started_at),
+            trace_id,
+        )
         return {"status": "error", "message": str(exc)}
 
-    return {
+    response = {
         "status": "ok",
         "tools": tools,
         "server_id": runtime.get("config_id"),
     }
+    logger.info(
+        "Sandbox discover_mcp_tools server_id=%s status=ok tools=%s duration_ms=%s trace_id=%s",
+        runtime.get("config_id"),
+        len(tools),
+        _elapsed_ms(started_at),
+        trace_id,
+    )
+    return response
 
 
 _ROUTES: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
@@ -1250,6 +1460,7 @@ _ROUTES: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
 
 
 def application(environ: Dict[str, Any], start_response: Callable) -> list[bytes]:
+    started_at = time.monotonic()
     path = environ.get("PATH_INFO", "") or ""
     method = environ.get("REQUEST_METHOD", "GET").upper()
 
@@ -1257,16 +1468,40 @@ def application(environ: Dict[str, Any], start_response: Callable) -> list[bytes
         return _json_response(start_response, "200 OK", {"status": "ok"})
 
     if method != "POST":
+        logger.warning(
+            "Sandbox request rejected path=%s method=%s http_status=405 duration_ms=%s",
+            path,
+            method,
+            _elapsed_ms(started_at),
+        )
         return _json_response(start_response, "405 Method Not Allowed", {"status": "error", "message": "POST only."})
 
     auth_error = _require_auth(environ)
     if auth_error:
+        logger.warning(
+            "Sandbox request rejected path=%s method=%s http_status=401 duration_ms=%s",
+            path,
+            method,
+            _elapsed_ms(started_at),
+        )
         return _json_response(start_response, "401 Unauthorized", auth_error)
 
     payload, parse_error = _parse_json(environ)
     if parse_error:
+        logger.warning(
+            "Sandbox request rejected path=%s method=%s http_status=400 reason=parse_error duration_ms=%s",
+            path,
+            method,
+            _elapsed_ms(started_at),
+        )
         return _json_response(start_response, "400 Bad Request", parse_error)
     if payload is None:
+        logger.warning(
+            "Sandbox request rejected path=%s method=%s http_status=400 reason=invalid_payload duration_ms=%s",
+            path,
+            method,
+            _elapsed_ms(started_at),
+        )
         return _json_response(start_response, "400 Bad Request", {"status": "error", "message": "Invalid request."})
     traceparent, trace_id = _extract_traceparent(environ)
     if traceparent:
@@ -1276,16 +1511,58 @@ def application(environ: Dict[str, Any], start_response: Callable) -> list[bytes
 
     handler = _ROUTES.get(path.rstrip("/"))
     if not handler:
+        logger.warning(
+            "Sandbox request rejected path=%s method=%s http_status=404 trace_id=%s duration_ms=%s",
+            path,
+            method,
+            trace_id,
+            _elapsed_ms(started_at),
+        )
         return _json_response(start_response, "404 Not Found", {"status": "error", "message": "Unknown endpoint."})
+
+    agent_id = payload.get("agent_id")
+    if not isinstance(agent_id, str):
+        agent_id = None
+    elif not agent_id.strip():
+        agent_id = None
+    else:
+        agent_id = agent_id.strip()
 
     try:
         result = handler(payload)
     except Exception:
-        logger.exception("Sandbox compute request failed for %s", path)
+        logger.exception(
+            "Sandbox compute request failed path=%s method=%s agent=%s trace_id=%s duration_ms=%s",
+            path,
+            method,
+            agent_id,
+            trace_id,
+            _elapsed_ms(started_at),
+        )
         return _json_response(
             start_response,
             "200 OK",
             {"status": "error", "message": "Sandbox compute request failed."},
         )
+
+    status = "unknown"
+    if isinstance(result, dict):
+        maybe_status = result.get("status")
+        if isinstance(maybe_status, str) and maybe_status:
+            status = maybe_status
+
+    logger.info(
+        (
+            "Sandbox request completed path=%s method=%s agent=%s status=%s "
+            "trace_id=%s duration_ms=%s payload_bytes=%s"
+        ),
+        path,
+        method,
+        agent_id,
+        status,
+        trace_id,
+        _elapsed_ms(started_at),
+        environ.get("CONTENT_LENGTH", "0"),
+    )
 
     return _json_response(start_response, "200 OK", result)
