@@ -403,6 +403,33 @@ def _truncate_streams(stdout: str, stderr: str) -> Tuple[str, str]:
     )
 
 
+def _stderr_summary(stderr: str) -> str:
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return lines[-1]
+
+
+def _build_nonzero_exit_error_payload(
+    *,
+    process_name: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+) -> Dict[str, Any]:
+    summary = _stderr_summary(stderr)
+    payload: Dict[str, Any] = {
+        "status": "error",
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "message": summary or f"{process_name} exited with status {exit_code}.",
+    }
+    if stderr.strip():
+        payload["detail"] = stderr
+    return payload
+
+
 def _extract_traceparent(environ: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     raw = environ.get(_TRACEPARENT_HEADER)
     if not isinstance(raw, str) or not raw.strip():
@@ -574,12 +601,20 @@ def _handle_run_command(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "error", "message": f"Command failed to start: {exc}"}
 
     stdout, stderr = _truncate_streams(result.stdout or "", result.stderr or "")
-    response = {
-        "status": "ok" if result.returncode == 0 else "error",
-        "exit_code": result.returncode,
-        "stdout": stdout,
-        "stderr": stderr,
-    }
+    if result.returncode != 0:
+        response = _build_nonzero_exit_error_payload(
+            process_name="Command",
+            exit_code=result.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    else:
+        response = {
+            "status": "ok",
+            "exit_code": result.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
     duration_ms = int((time.time() - start) * 1000)
     trace_id, _traceparent = _trace_context(payload)
     logger.info(
@@ -642,12 +677,20 @@ def _handle_python_exec(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "error", "message": f"Python execution failed to start: {exc}"}
 
     stdout, stderr = _truncate_streams(result.stdout or "", result.stderr or "")
-    response = {
-        "status": "ok" if result.returncode == 0 else "error",
-        "exit_code": result.returncode,
-        "stdout": stdout,
-        "stderr": stderr,
-    }
+    if result.returncode != 0:
+        response = _build_nonzero_exit_error_payload(
+            process_name="Python",
+            exit_code=result.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    else:
+        response = {
+            "status": "ok",
+            "exit_code": result.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
     return response
 
 
