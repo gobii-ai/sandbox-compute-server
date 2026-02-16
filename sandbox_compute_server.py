@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import mimetypes
@@ -250,6 +251,57 @@ def _parse_entry_updated_at(entry: Dict[str, Any]) -> Optional[float]:
         return parsed.timestamp()
     except ValueError:
         return None
+
+
+def _normalize_checksum(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    checksum = value.strip().lower()
+    if len(checksum) != 64:
+        return None
+    if any(ch not in "0123456789abcdef" for ch in checksum):
+        return None
+    return checksum
+
+
+def _checksum_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _read_file_checksum(path: Path) -> Optional[str]:
+    try:
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256()
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _resolve_local_checksum(path: Path, cache_entry: Any) -> Optional[str]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+
+    if isinstance(cache_entry, dict):
+        cached_checksum = _normalize_checksum(cache_entry.get("checksum_sha256"))
+        cached_mtime = cache_entry.get("mtime")
+        cached_size = cache_entry.get("size")
+        if (
+            cached_checksum
+            and isinstance(cached_mtime, (int, float))
+            and isinstance(cached_size, int)
+            and stat.st_size == cached_size
+            and abs(stat.st_mtime - float(cached_mtime)) <= 1e-6
+        ):
+            return cached_checksum
+
+    return _read_file_checksum(path)
 
 
 def _normalize_workspace_path(agent_root: Path, path: str) -> Tuple[Optional[Path], Optional[str]]:
@@ -830,14 +882,20 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
             except OSError:
                 continue
             mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            checksum_sha256 = _checksum_bytes(content)
             changes.append(
                 {
                     "path": rel,
                     "content_b64": base64.b64encode(content).decode("utf-8"),
                     "mime_type": mime_type,
+                    "checksum_sha256": checksum_sha256,
                 }
             )
-            manifest["files"][rel] = {"mtime": mtime, "size": stat.st_size}
+            manifest["files"][rel] = {
+                "mtime": mtime,
+                "size": stat.st_size,
+                "checksum_sha256": checksum_sha256,
+            }
             manifest["deleted"].pop(rel, None)
             uploaded_files += 1
             uploaded_bytes += len(content)
@@ -892,6 +950,7 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
         download_total_ms = 0
         inline_content_files = 0
         deleted_entries = 0
+        checksum_skips = 0
         proxy_env = _proxy_env_from_manifest(agent_root)
         for entry in entries:
             if not isinstance(entry, dict):
@@ -922,6 +981,26 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
                 deleted_at = entry_updated_at if entry_updated_at is not None else time.time()
                 manifest.setdefault("deleted", {})[normalized] = {"deleted_at": deleted_at}
                 continue
+
+            remote_checksum = _normalize_checksum(entry.get("checksum_sha256"))
+            local_meta = manifest.get("files", {}).get(normalized)
+            if remote_checksum and full_path.exists():
+                local_checksum = _resolve_local_checksum(full_path, local_meta)
+                if local_checksum == remote_checksum:
+                    try:
+                        local_stat = full_path.stat()
+                    except OSError:
+                        local_stat = None
+                    manifest["files"][normalized] = {
+                        "mtime": local_stat.st_mtime if local_stat else time.time(),
+                        "size": local_stat.st_size if local_stat else 0,
+                        "updated_at": entry.get("updated_at"),
+                        "checksum_sha256": remote_checksum,
+                    }
+                    manifest["deleted"].pop(normalized, None)
+                    skipped += 1
+                    checksum_skips += 1
+                    continue
 
             content = _decode_content(entry)
             if content is None and entry.get("download_url"):
@@ -1023,10 +1102,12 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
             except OSError as exc:
                 logger.exception("Failed to write synced file agent=%s path=%s", agent_id, normalized)
                 return {"status": "error", "message": f"Failed to write {normalized}: {exc}"}
+            written_checksum = remote_checksum or _checksum_bytes(content)
             manifest["files"][normalized] = {
                 "mtime": full_path.stat().st_mtime,
                 "size": full_path.stat().st_size,
                 "updated_at": entry.get("updated_at"),
+                "checksum_sha256": written_checksum,
             }
             manifest["deleted"].pop(normalized, None)
 
@@ -1036,12 +1117,13 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
             "applied": len(entries) - skipped,
             "skipped": skipped,
             "conflicts": conflicts,
+            "sync_timestamp": datetime.now(timezone.utc).isoformat(),
         }
         logger.info(
             (
                 "Sandbox sync_filespace agent=%s direction=pull status=ok "
                 "entries=%s applied=%s skipped=%s conflicts=%s deleted_entries=%s "
-                "inline_files=%s downloaded_files=%s downloaded_bytes=%s download_ms=%s "
+                "checksum_skips=%s inline_files=%s downloaded_files=%s downloaded_bytes=%s download_ms=%s "
                 "pull_ms=%s manifest_load_ms=%s total_ms=%s proxy_env_updated=%s trace_id=%s"
             ),
             agent_id,
@@ -1050,6 +1132,7 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
             skipped,
             conflicts,
             deleted_entries,
+            checksum_skips,
             inline_content_files,
             downloaded_files,
             downloaded_bytes,
