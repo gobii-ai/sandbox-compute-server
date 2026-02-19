@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,9 +16,21 @@ from mcp.client.stdio import stdio_client
 
 from sandbox_compute_server.config import _agent_workspace, _mcp_timeout_seconds
 from sandbox_compute_server.manifest import _proxy_env_from_manifest, _store_proxy_env
+from sandbox_compute_server.mcp_remote import (
+    default_config_dir,
+    normalize_mcp_remote_args,
+)
 from sandbox_compute_server.workspace import _elapsed_ms, _require_agent_id, _trace_context
 
 logger = logging.getLogger(__name__)
+
+
+class MCPRemoteAuthRequired(RuntimeError):
+    """Raised when mcp-remote requests user authorization in bridge mode."""
+
+    def __init__(self, event: Dict[str, Any]):
+        super().__init__("MCP remote authorization required.")
+        self.event = event
 
 
 class GobiiStdioTransport(FastMCPStdioTransport):
@@ -33,14 +46,76 @@ class GobiiStdioTransport(FastMCPStdioTransport):
     ):
         super().__init__(command=command, args=args, env=env, cwd=cwd, keep_alive=keep_alive)
         self._errlog_fallback = None
+        self._stderr_reader = None
+        self._stderr_writer = None
+        self._stderr_sink = None
+        self._stderr_thread = None
+        self._auth_event: Optional[Dict[str, Any]] = None
+        self._auth_lock = threading.Lock()
 
     def _resolve_errlog(self):
+        if self._stderr_writer is not None:
+            return self._stderr_writer
+
+        sink = None
         for candidate in (getattr(sys, "__stderr__", None), sys.stderr):
-            if candidate and hasattr(candidate, "fileno"):
-                return candidate
-        if self._errlog_fallback is None:
-            self._errlog_fallback = open(os.devnull, "w")
-        return self._errlog_fallback
+            if candidate and hasattr(candidate, "write"):
+                sink = candidate
+                break
+        if sink is None:
+            if self._errlog_fallback is None:
+                self._errlog_fallback = open(os.devnull, "w")
+            sink = self._errlog_fallback
+
+        read_fd, write_fd = os.pipe()
+        self._stderr_reader = os.fdopen(read_fd, "r", buffering=1, encoding="utf-8", errors="replace")
+        self._stderr_writer = os.fdopen(write_fd, "w", buffering=1, encoding="utf-8", errors="replace")
+        self._stderr_sink = sink
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, name="mcp-stderr-drain", daemon=True)
+        self._stderr_thread.start()
+        return self._stderr_writer
+
+    def _drain_stderr(self):
+        if self._stderr_reader is None:
+            return
+        try:
+            for line in self._stderr_reader:
+                if line:
+                    self._capture_auth_event(line)
+                    if self._stderr_sink:
+                        try:
+                            self._stderr_sink.write(line)
+                            self._stderr_sink.flush()
+                        except OSError:
+                            pass
+        except OSError:
+            return
+
+    def _capture_auth_event(self, line: str):
+        marker = "MCP_REMOTE_AUTH_URL "
+        index = line.find(marker)
+        if index < 0:
+            return
+        payload = line[index + len(marker) :].strip()
+        if not payload:
+            return
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            logger.debug("Failed parsing MCP_REMOTE_AUTH_URL payload: %s", payload)
+            return
+        if not isinstance(event, dict):
+            return
+        with self._auth_lock:
+            self._auth_event = event
+
+    def pop_auth_event(self) -> Optional[Dict[str, Any]]:
+        with self._auth_lock:
+            if not self._auth_event:
+                return None
+            event = dict(self._auth_event)
+            self._auth_event = None
+            return event
 
     async def connect(self, **session_kwargs):
         if self._connect_task is not None:
@@ -69,6 +144,9 @@ class GobiiStdioTransport(FastMCPStdioTransport):
                     self._ready_event.set()
 
                     await self._stop_event.wait()
+            except Exception:
+                self._ready_event.set()
+                raise
             finally:
                 self._session = None
                 logger.debug("Stdio transport disconnected")
@@ -90,6 +168,22 @@ class GobiiStdioTransport(FastMCPStdioTransport):
         self._cleanup_errlog()
 
     def _cleanup_errlog(self):
+        if self._stderr_writer:
+            try:
+                self._stderr_writer.close()
+            except OSError:
+                pass
+            self._stderr_writer = None
+        if self._stderr_thread and self._stderr_thread.is_alive():
+            self._stderr_thread.join(timeout=0.2)
+        self._stderr_thread = None
+        if self._stderr_reader:
+            try:
+                self._stderr_reader.close()
+            except OSError:
+                pass
+            self._stderr_reader = None
+        self._stderr_sink = None
         if self._errlog_fallback:
             try:
                 self._errlog_fallback.close()
@@ -115,7 +209,60 @@ def _coerce_str_dict(value: Any) -> Dict[str, str]:
     return cleaned
 
 
-def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _coerce_bridge_dict(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    bridge: Dict[str, Any] = {}
+    for key in (
+        "auth_mode",
+        "redirect_url",
+        "poll_url",
+        "notify_url",
+        "auth_session_id",
+    ):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            bridge[key] = text
+    for key in ("poll_interval_seconds", "auth_timeout_seconds"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            bridge[key] = int(text)
+        except ValueError:
+            logger.debug("Ignoring invalid bridge option %s=%s", key, text)
+    return bridge
+
+
+def _normalize_mcp_remote_runtime(runtime: Dict[str, Any], *, agent_id: Optional[str] = None) -> Dict[str, Any]:
+    command = str(runtime.get("command") or "").strip()
+    args = [str(arg) for arg in runtime.get("args") or []]
+    bridge = _coerce_bridge_dict(runtime.get("mcp_remote_bridge"))
+    is_remote, normalized_args = normalize_mcp_remote_args(command, args, bridge)
+    if not is_remote:
+        return runtime
+
+    normalized = dict(runtime)
+    normalized["args"] = normalized_args
+
+    env = _coerce_str_dict(runtime.get("env") or {})
+    config_id = str(runtime.get("config_id") or "").strip()
+    env.setdefault("MCP_REMOTE_CONFIG_DIR", default_config_dir(config_id, agent_id=agent_id))
+    normalized["env"] = env
+    return normalized
+
+
+def _parse_mcp_server_payload(
+    payload: Dict[str, Any],
+    *,
+    agent_id: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     raw = payload.get("server")
     if not isinstance(raw, dict):
         return None, {"status": "error", "message": "Missing MCP server definition."}
@@ -142,10 +289,12 @@ def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[st
     env = _coerce_str_dict(raw.get("env") or raw.get("environment") or {})
     headers = _coerce_str_dict(raw.get("headers") or {})
 
+    bridge = _coerce_bridge_dict(raw.get("mcp_remote_bridge") or payload.get("mcp_remote_bridge"))
+
     if not command and not url:
         return None, {"status": "error", "message": "MCP server must include a command or URL."}
 
-    return {
+    runtime = {
         "config_id": config_id.strip(),
         "name": name.strip(),
         "command": command,
@@ -153,7 +302,9 @@ def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[st
         "url": url,
         "env": env,
         "headers": headers,
-    }, None
+        "mcp_remote_bridge": bridge,
+    }
+    return _normalize_mcp_remote_runtime(runtime, agent_id=agent_id), None
 
 
 def _normalize_mcp_result(result: Any) -> Any:
@@ -174,6 +325,31 @@ def _normalize_mcp_result(result: Any) -> Any:
     return str(result)
 
 
+def _extract_auth_url(event: Dict[str, Any]) -> str:
+    for key in ("authorization_url", "auth_url", "url"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _action_required_response(event: Dict[str, Any]) -> Dict[str, Any]:
+    connect_url = _extract_auth_url(event)
+    message = "Authorization required. Open the provided connect URL to continue."
+    response: Dict[str, Any] = {
+        "status": "action_required",
+        "message": message,
+        "result": message,
+        "auth": event,
+    }
+    if connect_url:
+        response["connect_url"] = connect_url
+    session_id = event.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        response["auth_session_id"] = session_id.strip()
+    return response
+
+
 async def _call_mcp_tool(runtime: Dict[str, Any], tool_name: str, params: Dict[str, Any]) -> Any:
     if runtime.get("url"):
         transport = StreamableHttpTransport(url=runtime["url"], headers=runtime["headers"])
@@ -185,9 +361,16 @@ async def _call_mcp_tool(runtime: Dict[str, Any], tool_name: str, params: Dict[s
         )
 
     client = Client(transport)
-    async with client:
-        timeout = _mcp_timeout_seconds()
-        return await asyncio.wait_for(client.call_tool(tool_name, params), timeout=timeout)
+    try:
+        async with client:
+            timeout = _mcp_timeout_seconds()
+            return await asyncio.wait_for(client.call_tool(tool_name, params), timeout=timeout)
+    except Exception as exc:
+        if isinstance(transport, GobiiStdioTransport):
+            auth_event = transport.pop_auth_event()
+            if auth_event:
+                raise MCPRemoteAuthRequired(auth_event) from exc
+        raise
 
 
 async def _discover_mcp_tools(runtime: Dict[str, Any]) -> list[Dict[str, Any]]:
@@ -201,8 +384,15 @@ async def _discover_mcp_tools(runtime: Dict[str, Any]) -> list[Dict[str, Any]]:
         )
 
     client = Client(transport)
-    async with client:
-        tools = await client.list_tools()
+    try:
+        async with client:
+            tools = await client.list_tools()
+    except Exception as exc:
+        if isinstance(transport, GobiiStdioTransport):
+            auth_event = transport.pop_auth_event()
+            if auth_event:
+                raise MCPRemoteAuthRequired(auth_event) from exc
+        raise
 
     serialized: list[Dict[str, Any]] = []
     for tool in tools or []:
@@ -237,7 +427,7 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     agent_root = _agent_workspace(agent_id)
     _store_proxy_env(agent_root, payload)
 
-    runtime, runtime_error = _parse_mcp_server_payload(payload)
+    runtime, runtime_error = _parse_mcp_server_payload(payload, agent_id=agent_id)
     if runtime_error:
         return runtime_error
     proxy_env = _proxy_env_from_manifest(agent_root)
@@ -251,6 +441,20 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         result = asyncio.run(_call_mcp_tool(runtime, tool_name.strip(), params))
+    except MCPRemoteAuthRequired as auth_required:
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        response = _action_required_response(auth_required.event)
+        logger.info(
+            "Sandbox mcp_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
+            agent_id,
+            tool_name,
+            response.get("status"),
+            duration_ms,
+            trace_id,
+            json.dumps(response, sort_keys=True, ensure_ascii=True),
+        )
+        return response
     except Exception as exc:
         duration_ms = int((time.time() - start) * 1000)
         trace_id, _traceparent = _trace_context(payload)
@@ -296,6 +500,17 @@ def _handle_discover_mcp_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
     trace_id, _traceparent = _trace_context(payload)
     try:
         tools = asyncio.run(_discover_mcp_tools(runtime))
+    except MCPRemoteAuthRequired as auth_required:
+        response = _action_required_response(auth_required.event)
+        response["server_id"] = runtime.get("config_id")
+        logger.info(
+            "Sandbox discover_mcp_tools server_id=%s status=%s duration_ms=%s trace_id=%s",
+            runtime.get("config_id"),
+            response.get("status"),
+            _elapsed_ms(started_at),
+            trace_id,
+        )
+        return response
     except Exception as exc:
         logger.exception(
             "Sandbox discover_mcp_tools failed server_id=%s duration_ms=%s trace_id=%s",
