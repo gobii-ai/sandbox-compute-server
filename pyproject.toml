@@ -17,4 +17,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["sandbox_compute_server", "sandbox_utils", "logging_config"]
+py-modules = ["sandbox_utils", "logging_config"]
+
+[tool.setuptools.packages.find]
+include = ["sandbox_compute_server*"]

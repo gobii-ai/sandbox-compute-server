@@ -30,7 +30,8 @@ RUN --mount=type=cache,target=/var/cache/apt \
 RUN pip install --upgrade pip
 
 COPY pyproject.toml README.md ./
-COPY sandbox_compute_server.py sandbox_utils.py logging_config.py ./
+COPY sandbox_compute_server ./sandbox_compute_server
+COPY sandbox_utils.py logging_config.py ./
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir .
