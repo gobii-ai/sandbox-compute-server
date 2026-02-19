@@ -3,7 +3,8 @@ __pycache__/
 .ra-aid/
 .ra-msg
 .idea
-.run/
+
+uv.lock
 
 **/.claude/settings.local.json
 
