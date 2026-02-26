@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 
@@ -16,6 +18,14 @@ _DEFAULT_CONFIG_DIR = "/workspace/.mcp-auth"
 _START_WAIT_SECONDS = 1.5
 _RUNTIME_WAIT_SECONDS = 2.0
 _FINISHED_RETENTION_SECONDS = 600
+_REMOTE_AUTH_STATE_VERSION = 1
+_REMOTE_AUTH_STATE_MAX_FILES = 64
+_REMOTE_AUTH_STATE_MAX_BYTES = 512 * 1024
+_REMOTE_AUTH_STATE_ALLOWED_SUFFIXES = (
+    "_client_info.json",
+    "_tokens.json",
+    "_code_verifier.txt",
+)
 
 
 def _now() -> float:
@@ -61,6 +71,126 @@ def _strip_flags(args: list[str]) -> list[str]:
     return cleaned
 
 
+def _resolve_config_dir(env: Dict[str, str]) -> Path:
+    raw = str(env.get("MCP_REMOTE_CONFIG_DIR") or _DEFAULT_CONFIG_DIR).strip() or _DEFAULT_CONFIG_DIR
+    return Path(raw)
+
+
+def _allowed_remote_auth_path(path: str) -> bool:
+    filename = Path(path).name
+    return any(filename.endswith(suffix) for suffix in _REMOTE_AUTH_STATE_ALLOWED_SUFFIXES)
+
+
+def _restore_remote_auth_state(runtime: Dict[str, Any]) -> None:
+    state = runtime.get("remote_auth_state")
+    if not isinstance(state, dict):
+        return
+
+    files = state.get("files")
+    if not isinstance(files, list):
+        return
+
+    env = runtime.get("env")
+    if not isinstance(env, dict):
+        return
+
+    config_dir = _resolve_config_dir({str(k): str(v) for k, v in env.items() if k is not None and v is not None})
+    base_dir = config_dir.resolve()
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    restored = 0
+    total_bytes = 0
+    for entry in files:
+        if restored >= _REMOTE_AUTH_STATE_MAX_FILES:
+            break
+        if not isinstance(entry, dict):
+            continue
+
+        rel_path = str(entry.get("path") or "").strip()
+        content_b64 = entry.get("content_b64")
+        if not rel_path or not isinstance(content_b64, str):
+            continue
+        if not _allowed_remote_auth_path(rel_path):
+            continue
+
+        rel = Path(rel_path)
+        if rel.is_absolute() or ".." in rel.parts:
+            continue
+
+        try:
+            content = base64.b64decode(content_b64.encode("ascii"), validate=True)
+        except (ValueError, TypeError):
+            continue
+
+        total_bytes += len(content)
+        if total_bytes > _REMOTE_AUTH_STATE_MAX_BYTES:
+            logger.warning("Remote auth state too large while restoring; skipping remaining files")
+            break
+
+        target = (base_dir / rel).resolve()
+        if base_dir != target and base_dir not in target.parents:
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.write_bytes(content)
+        except OSError:
+            logger.warning("Failed writing restored remote auth file path=%s", target, exc_info=True)
+            continue
+        restored += 1
+
+    if restored:
+        logger.info("Restored remote auth state files=%s dir=%s", restored, str(base_dir))
+
+
+def _capture_remote_auth_state(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    env = runtime.get("env")
+    if not isinstance(env, dict):
+        return {}
+    config_dir = _resolve_config_dir({str(k): str(v) for k, v in env.items() if k is not None and v is not None})
+    if not config_dir.exists():
+        return {}
+
+    base_dir = config_dir.resolve()
+    files: list[Dict[str, str]] = []
+    total_bytes = 0
+
+    try:
+        candidates = sorted(path for path in base_dir.rglob("*") if path.is_file())
+    except OSError:
+        logger.warning("Failed scanning remote auth config dir=%s", str(base_dir), exc_info=True)
+        return {}
+
+    for path in candidates:
+        if len(files) >= _REMOTE_AUTH_STATE_MAX_FILES:
+            break
+        rel_path = path.relative_to(base_dir).as_posix()
+        if not _allowed_remote_auth_path(rel_path):
+            continue
+        try:
+            content = path.read_bytes()
+        except OSError:
+            continue
+        total_bytes += len(content)
+        if total_bytes > _REMOTE_AUTH_STATE_MAX_BYTES:
+            logger.warning("Remote auth state too large while capturing dir=%s", str(base_dir))
+            break
+        files.append(
+            {
+                "path": rel_path,
+                "content_b64": base64.b64encode(content).decode("ascii"),
+            }
+        )
+
+    if not files:
+        return {}
+
+    return {
+        "version": _REMOTE_AUTH_STATE_VERSION,
+        "files": files,
+    }
+
+
 @dataclass
 class RemoteAuthSession:
     session_id: str
@@ -77,6 +207,7 @@ class RemoteAuthSession:
     code_consumed: bool = False
     completed_at: float = 0.0
     tool_count: int = 0
+    remote_auth_state: Dict[str, Any] = field(default_factory=dict)
     auth_url_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -84,7 +215,7 @@ class RemoteAuthSession:
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
-            return {
+            payload = {
                 "status": self.status,
                 "session_id": self.session_id,
                 "config_id": self.config_id,
@@ -95,6 +226,9 @@ class RemoteAuthSession:
                 "expires_at": int(self.expires_at),
                 "tool_count": self.tool_count,
             }
+            if self.remote_auth_state and self.status == "authorized":
+                payload["remote_auth_state"] = self.remote_auth_state
+            return payload
 
 
 class MCPRemoteAuthManager:
@@ -192,6 +326,7 @@ class MCPRemoteAuthManager:
                 session.auth_state = state
             if session.status not in {"authorized"}:
                 session.status = "code_submitted"
+        session.done_event.wait(2.0)
         return session.snapshot()
 
     def notify_authorization_url(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -251,10 +386,12 @@ class MCPRemoteAuthManager:
         try:
             runtime = _build_bridge_runtime(server, session)
             tools = asyncio.run(_discover_tools(runtime))
+            remote_auth_state = _capture_remote_auth_state(runtime)
             with session.lock:
                 session.status = "authorized"
                 session.error = ""
                 session.tool_count = len(tools)
+                session.remote_auth_state = remote_auth_state
                 session.completed_at = _now()
                 session.done_event.set()
                 _log_lifecycle("authorized", session, tool_count=session.tool_count)
@@ -314,8 +451,7 @@ def _build_bridge_runtime(server: Dict[str, Any], session: RemoteAuthSession) ->
         ]
     )
     env.setdefault("MCP_REMOTE_CONFIG_DIR", _DEFAULT_CONFIG_DIR)
-
-    return {
+    runtime = {
         "config_id": server.get("config_id") or session.config_id,
         "name": server.get("name") or "mcp-remote",
         "command": command,
@@ -324,6 +460,8 @@ def _build_bridge_runtime(server: Dict[str, Any], session: RemoteAuthSession) ->
         "env": env,
         "headers": {},
     }
+    _restore_remote_auth_state(runtime)
+    return runtime
 
 
 _MANAGER = MCPRemoteAuthManager()
@@ -435,3 +573,11 @@ def ensure_runtime_remote_auth(runtime: Dict[str, Any]) -> Dict[str, Any]:
         "status": "error",
         "message": str(snapshot.get("error") or "Remote auth session failed."),
     }
+
+
+def hydrate_runtime_remote_auth_state(runtime: Dict[str, Any]) -> None:
+    _restore_remote_auth_state(runtime)
+
+
+def snapshot_runtime_remote_auth_state(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    return _capture_remote_auth_state(runtime)

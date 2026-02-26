@@ -15,7 +15,11 @@ from mcp.client.stdio import stdio_client
 
 from sandbox_compute_server.config import _agent_workspace, _mcp_timeout_seconds
 from sandbox_compute_server.manifest import _proxy_env_from_manifest, _store_proxy_env
-from sandbox_compute_server.mcp_remote_auth import ensure_runtime_remote_auth
+from sandbox_compute_server.mcp_remote_auth import (
+    ensure_runtime_remote_auth,
+    hydrate_runtime_remote_auth_state,
+    snapshot_runtime_remote_auth_state,
+)
 from sandbox_compute_server.workspace import _elapsed_ms, _require_agent_id, _trace_context
 
 logger = logging.getLogger(__name__)
@@ -146,6 +150,9 @@ def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[st
     remote_auth_callback_base_url = raw.get("remote_auth_callback_base_url") or ""
     if not isinstance(remote_auth_callback_base_url, str):
         remote_auth_callback_base_url = str(remote_auth_callback_base_url)
+    remote_auth_state = raw.get("remote_auth_state")
+    if not isinstance(remote_auth_state, dict):
+        remote_auth_state = {}
 
     if not command and not url:
         return None, {"status": "error", "message": "MCP server must include a command or URL."}
@@ -160,6 +167,7 @@ def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[st
         "headers": headers,
         "is_remote_mcp_remote": is_remote_mcp_remote,
         "remote_auth_callback_base_url": remote_auth_callback_base_url.strip(),
+        "remote_auth_state": remote_auth_state,
     }, None
 
 
@@ -280,6 +288,7 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     proxy_env = _proxy_env_from_manifest(agent_root)
     if proxy_env:
         runtime["env"] = {**runtime.get("env", {}), **proxy_env}
+    hydrate_runtime_remote_auth_state(runtime)
 
     tool_name = payload.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name.strip():
@@ -299,6 +308,9 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
             "remote_auth_session_id": runtime_auth.get("session_id") or "",
             "config_id": runtime.get("config_id"),
         }
+        remote_auth_state = snapshot_runtime_remote_auth_state(runtime)
+        if remote_auth_state:
+            response["remote_auth_state"] = remote_auth_state
         logger.info(
             "Sandbox mcp_request action_required agent=%s tool=%s duration_ms=%s trace_id=%s result=%s",
             agent_id,
@@ -324,6 +336,9 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
             trace_id,
         )
         response = {"status": "error", "message": str(exc)}
+        remote_auth_state = snapshot_runtime_remote_auth_state(runtime)
+        if remote_auth_state:
+            response["remote_auth_state"] = remote_auth_state
         logger.info(
             "Sandbox mcp_request agent=%s tool=%s status=%s duration_ms=%s trace_id=%s result=%s",
             agent_id,
@@ -336,6 +351,9 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
         return response
 
     response = {"status": "ok", "result": _normalize_mcp_result(result)}
+    remote_auth_state = snapshot_runtime_remote_auth_state(runtime)
+    if remote_auth_state:
+        response["remote_auth_state"] = remote_auth_state
     duration_ms = int((time.time() - start) * 1000)
     trace_id, _traceparent = _trace_context(payload)
     logger.info(
@@ -355,6 +373,7 @@ def _handle_discover_mcp_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
     runtime, runtime_error = _parse_mcp_server_payload(payload)
     if runtime_error:
         return runtime_error
+    hydrate_runtime_remote_auth_state(runtime)
     trace_id, _traceparent = _trace_context(payload)
     try:
         tools = asyncio.run(_discover_mcp_tools(runtime))
@@ -372,6 +391,9 @@ def _handle_discover_mcp_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
         "tools": tools,
         "server_id": runtime.get("config_id"),
     }
+    remote_auth_state = snapshot_runtime_remote_auth_state(runtime)
+    if remote_auth_state:
+        response["remote_auth_state"] = remote_auth_state
     logger.info(
         "Sandbox discover_mcp_tools server_id=%s status=ok tools=%s duration_ms=%s trace_id=%s",
         runtime.get("config_id"),
