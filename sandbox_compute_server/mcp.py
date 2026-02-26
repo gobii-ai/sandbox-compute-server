@@ -15,6 +15,7 @@ from mcp.client.stdio import stdio_client
 
 from sandbox_compute_server.config import _agent_workspace, _mcp_timeout_seconds
 from sandbox_compute_server.manifest import _proxy_env_from_manifest, _store_proxy_env
+from sandbox_compute_server.mcp_remote_auth import ensure_runtime_remote_auth
 from sandbox_compute_server.workspace import _elapsed_ms, _require_agent_id, _trace_context
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,10 @@ def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[st
     args = _coerce_str_list(raw.get("command_args") or raw.get("args") or [])
     env = _coerce_str_dict(raw.get("env") or raw.get("environment") or {})
     headers = _coerce_str_dict(raw.get("headers") or {})
+    is_remote_mcp_remote = bool(raw.get("is_remote_mcp_remote"))
+    remote_auth_callback_base_url = raw.get("remote_auth_callback_base_url") or ""
+    if not isinstance(remote_auth_callback_base_url, str):
+        remote_auth_callback_base_url = str(remote_auth_callback_base_url)
 
     if not command and not url:
         return None, {"status": "error", "message": "MCP server must include a command or URL."}
@@ -153,6 +158,8 @@ def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[st
         "url": url,
         "env": env,
         "headers": headers,
+        "is_remote_mcp_remote": is_remote_mcp_remote,
+        "remote_auth_callback_base_url": remote_auth_callback_base_url.strip(),
     }, None
 
 
@@ -248,6 +255,31 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(tool_name, str) or not tool_name.strip():
         return {"status": "error", "message": "Missing required parameter: tool_name"}
     params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+
+    runtime_auth = ensure_runtime_remote_auth(runtime)
+    if runtime_auth.get("status") == "action_required":
+        duration_ms = int((time.time() - start) * 1000)
+        trace_id, _traceparent = _trace_context(payload)
+        action_message = str(runtime_auth.get("message") or "Authorization required.")
+        response = {
+            "status": "action_required",
+            "message": action_message,
+            "result": action_message,
+            "connect_url": runtime_auth.get("connect_url") or "",
+            "remote_auth_session_id": runtime_auth.get("session_id") or "",
+            "config_id": runtime.get("config_id"),
+        }
+        logger.info(
+            "Sandbox mcp_request action_required agent=%s tool=%s duration_ms=%s trace_id=%s result=%s",
+            agent_id,
+            tool_name,
+            duration_ms,
+            trace_id,
+            json.dumps(response, sort_keys=True, ensure_ascii=True),
+        )
+        return response
+    if runtime_auth.get("status") == "error":
+        return {"status": "error", "message": str(runtime_auth.get("message") or "Remote auth check failed.")}
 
     try:
         result = asyncio.run(_call_mcp_tool(runtime, tool_name.strip(), params))
