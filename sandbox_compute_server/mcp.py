@@ -164,21 +164,51 @@ def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[st
 
 
 def _normalize_mcp_result(result: Any) -> Any:
-    if isinstance(result, (dict, list, str, int, float, bool)) or result is None:
+    """Recursively coerce MCP SDK objects into JSON-serializable structures."""
+    if result is None or isinstance(result, (str, int, float, bool)):
         return result
+
+    if isinstance(result, bytes):
+        return result.decode("utf-8", errors="replace")
+
+    if isinstance(result, dict):
+        return {
+            str(key): _normalize_mcp_result(value)
+            for key, value in result.items()
+        }
+
+    if isinstance(result, (list, tuple, set)):
+        return [_normalize_mcp_result(item) for item in result]
+
     if hasattr(result, "model_dump"):
         try:
-            return result.model_dump()
+            return _normalize_mcp_result(result.model_dump())
         except Exception:
             logger.debug("Failed to serialize MCP result via model_dump()", exc_info=True)
+
     if hasattr(result, "dict"):
         try:
-            return result.dict()
+            return _normalize_mcp_result(result.dict())
         except Exception:
             logger.debug("Failed to serialize MCP result via dict()", exc_info=True)
+
     if hasattr(result, "__dict__"):
-        return result.__dict__
+        try:
+            data = {
+                str(key): value
+                for key, value in vars(result).items()
+                if not str(key).startswith("_")
+            }
+            return _normalize_mcp_result(data)
+        except Exception:
+            logger.debug("Failed to serialize MCP result via __dict__", exc_info=True)
+
     return str(result)
+
+
+def _safe_json_dumps(value: Any) -> str:
+    # Logging should never raise, even if a result adapter returns custom objects.
+    return json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
 
 
 async def _call_mcp_tool(runtime: Dict[str, Any], tool_name: str, params: Dict[str, Any]) -> Any:
@@ -275,7 +305,7 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
             tool_name,
             duration_ms,
             trace_id,
-            json.dumps(response, sort_keys=True, ensure_ascii=True),
+            _safe_json_dumps(response),
         )
         return response
     if runtime_auth.get("status") == "error":
@@ -301,7 +331,7 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
             response.get("status"),
             duration_ms,
             trace_id,
-            json.dumps(response, sort_keys=True, ensure_ascii=True),
+            _safe_json_dumps(response),
         )
         return response
 
@@ -315,7 +345,7 @@ def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
         response.get("status"),
         duration_ms,
         trace_id,
-        json.dumps(response, sort_keys=True, ensure_ascii=True),
+        _safe_json_dumps(response),
     )
     return response
 
