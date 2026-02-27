@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from sandbox_compute_server.mcp import _handle_mcp_request, _normalize_mcp_result
+from sandbox_compute_server.mcp import _handle_mcp_request, _normalize_mcp_result, _parse_mcp_server_payload
 
 
 class _TextContent:
@@ -21,6 +21,25 @@ class _MCPCallResult:
 
 
 class MCPResultNormalizationTests(unittest.TestCase):
+    def test_parse_payload_injects_writable_stdio_cache_env(self):
+        runtime, error = _parse_mcp_server_payload(
+            {
+                "server": {
+                    "config_id": "cfg-1",
+                    "name": "postgres",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-postgres"],
+                    "env": {},
+                }
+            }
+        )
+        self.assertIsNone(error)
+        assert runtime is not None
+        self.assertEqual(runtime["env"].get("NPM_CONFIG_CACHE"), "/workspace/.npm-cache")
+        self.assertEqual(runtime["env"].get("npm_config_cache"), "/workspace/.npm-cache")
+        self.assertEqual(runtime["env"].get("XDG_CACHE_HOME"), "/workspace/.cache")
+        self.assertEqual(runtime["env"].get("HOME"), "/workspace")
+
     def test_normalize_result_handles_nested_non_json_objects(self):
         normalized = _normalize_mcp_result(_MCPCallResult())
         self.assertEqual(

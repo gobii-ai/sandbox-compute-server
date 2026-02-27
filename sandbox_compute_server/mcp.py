@@ -115,6 +115,18 @@ def _coerce_str_dict(value: Any) -> Dict[str, str]:
     return cleaned
 
 
+def _normalize_stdio_env(env: Dict[str, str]) -> Dict[str, str]:
+    normalized = dict(env)
+    npm_cache = normalized.get("NPM_CONFIG_CACHE") or normalized.get("npm_config_cache")
+    if not npm_cache:
+        npm_cache = "/workspace/.npm-cache"
+    normalized["NPM_CONFIG_CACHE"] = npm_cache
+    normalized["npm_config_cache"] = npm_cache
+    normalized.setdefault("XDG_CACHE_HOME", "/workspace/.cache")
+    normalized.setdefault("HOME", "/workspace")
+    return normalized
+
+
 def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     raw = payload.get("server")
     if not isinstance(raw, dict):
@@ -141,6 +153,8 @@ def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[st
     args = _coerce_str_list(raw.get("command_args") or raw.get("args") or [])
     env = _coerce_str_dict(raw.get("env") or raw.get("environment") or {})
     headers = _coerce_str_dict(raw.get("headers") or {})
+    if command:
+        env = _normalize_stdio_env(env)
 
     if not command and not url:
         return None, {"status": "error", "message": "MCP server must include a command or URL."}
