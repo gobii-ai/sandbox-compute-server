@@ -67,6 +67,33 @@ class MCPResultNormalizationTests(unittest.TestCase):
         self.assertEqual(runtime["env"].get("NPM_CONFIG_CACHE"), "/opt/custom-npm")
         self.assertEqual(runtime["env"].get("npm_config_cache"), "/opt/custom-npm")
 
+    def test_parse_payload_uses_configured_runtime_root(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "SANDBOX_RUNTIME_CACHE_ROOT": "/tmp/gobii-runtime-configured",
+            },
+            clear=False,
+        ):
+            runtime, error = _parse_mcp_server_payload(
+                {
+                    "agent_id": "agent-3",
+                    "server": {
+                        "config_id": "cfg-3",
+                        "name": "postgres",
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-postgres"],
+                        "env": {},
+                    },
+                }
+            )
+        self.assertIsNone(error)
+        assert runtime is not None
+        self.assertEqual(runtime["env"].get("NPM_CONFIG_CACHE"), "/tmp/gobii-runtime-configured/agent-3/npm")
+        self.assertEqual(runtime["env"].get("npm_config_cache"), "/tmp/gobii-runtime-configured/agent-3/npm")
+        self.assertEqual(runtime["env"].get("XDG_CACHE_HOME"), "/tmp/gobii-runtime-configured/agent-3/xdg")
+        self.assertEqual(runtime["env"].get("HOME"), "/tmp/gobii-runtime-configured/agent-3/home")
+
     def test_normalize_result_handles_nested_non_json_objects(self):
         normalized = _normalize_mcp_result(_MCPCallResult())
         self.assertEqual(

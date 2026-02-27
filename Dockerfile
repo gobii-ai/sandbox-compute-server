@@ -43,13 +43,13 @@ RUN echo "${GIT_COMMIT}" > /app/.git-commit
 
 RUN addgroup --system appgroup && \
     adduser --system --ingroup appgroup appuser && \
-    mkdir -p /tmp/.npm /tmp/.cache /workspace /var/tmp/gobii-runtime && \
-    chown -R appuser:appgroup /tmp/.npm /tmp/.cache /workspace /var/tmp/gobii-runtime
+    mkdir -p /tmp/.npm /tmp/.cache /tmp/gobii-runtime /workspace && \
+    chown -R appuser:appgroup /tmp/.npm /tmp/.cache /tmp/gobii-runtime /workspace
 ENV HOME=/tmp \
     NPM_CONFIG_CACHE=/tmp/.npm \
     npm_config_cache=/tmp/.npm \
     XDG_CACHE_HOME=/tmp/.cache \
-    SANDBOX_RUNTIME_CACHE_ROOT=/var/tmp/gobii-runtime
+    SANDBOX_RUNTIME_CACHE_ROOT=/tmp/gobii-runtime
 USER appuser
 
 EXPOSE 8080
