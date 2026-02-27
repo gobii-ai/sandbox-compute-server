@@ -56,7 +56,7 @@ def _workspace_root() -> Path:
 
 
 def _runtime_cache_root() -> Path:
-    root = os.environ.get("SANDBOX_RUNTIME_CACHE_ROOT", "/tmp/.cache/gobii-runtime").strip() or "/tmp/.cache/gobii-runtime"
+    root = os.environ.get("SANDBOX_RUNTIME_CACHE_ROOT", "/runtime-cache").strip() or "/runtime-cache"
     return Path(root)
 
 
