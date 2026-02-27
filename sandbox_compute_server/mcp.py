@@ -13,7 +13,7 @@ from fastmcp.client.transports import StreamableHttpTransport
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from sandbox_compute_server.config import _agent_workspace, _mcp_timeout_seconds
+from sandbox_compute_server.config import _agent_workspace, _mcp_timeout_seconds, _runtime_cache_paths, _workspace_root
 from sandbox_compute_server.manifest import _proxy_env_from_manifest, _store_proxy_env
 from sandbox_compute_server.workspace import _elapsed_ms, _require_agent_id, _trace_context
 
@@ -115,15 +115,37 @@ def _coerce_str_dict(value: Any) -> Dict[str, str]:
     return cleaned
 
 
-def _normalize_stdio_env(env: Dict[str, str]) -> Dict[str, str]:
+def _is_workspace_path(path_value: str) -> bool:
+    if not path_value:
+        return False
+    workspace = str(_workspace_root()).rstrip("/")
+    candidate = os.path.abspath(path_value)
+    return candidate == workspace or candidate.startswith(f"{workspace}/")
+
+
+def _normalize_stdio_env(env: Dict[str, str], *, runtime_identity: str) -> Dict[str, str]:
     normalized = dict(env)
-    npm_cache = normalized.get("NPM_CONFIG_CACHE") or normalized.get("npm_config_cache")
-    if not npm_cache:
-        npm_cache = "/workspace/.npm-cache"
-    normalized["NPM_CONFIG_CACHE"] = npm_cache
-    normalized["npm_config_cache"] = npm_cache
-    normalized.setdefault("XDG_CACHE_HOME", "/workspace/.cache")
-    normalized.setdefault("HOME", "/workspace")
+    runtime_paths = _runtime_cache_paths(runtime_identity)
+    home_path = str(runtime_paths["home"])
+    xdg_path = str(runtime_paths["xdg"])
+    npm_path = str(runtime_paths["npm"])
+
+    current_home = normalized.get("HOME", "").strip()
+    if not current_home or _is_workspace_path(current_home):
+        normalized["HOME"] = home_path
+
+    current_xdg = normalized.get("XDG_CACHE_HOME", "").strip()
+    if not current_xdg or _is_workspace_path(current_xdg):
+        normalized["XDG_CACHE_HOME"] = xdg_path
+
+    current_npm = (normalized.get("NPM_CONFIG_CACHE") or normalized.get("npm_config_cache") or "").strip()
+    if not current_npm or _is_workspace_path(current_npm):
+        normalized["NPM_CONFIG_CACHE"] = npm_path
+        normalized["npm_config_cache"] = npm_path
+    else:
+        normalized["NPM_CONFIG_CACHE"] = current_npm
+        normalized["npm_config_cache"] = current_npm
+
     return normalized
 
 
@@ -154,7 +176,8 @@ def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[st
     env = _coerce_str_dict(raw.get("env") or raw.get("environment") or {})
     headers = _coerce_str_dict(raw.get("headers") or {})
     if command:
-        env = _normalize_stdio_env(env)
+        runtime_identity = str(payload.get("agent_id") or f"discovery-{config_id.strip()}")
+        env = _normalize_stdio_env(env, runtime_identity=runtime_identity)
 
     if not command and not url:
         return None, {"status": "error", "message": "MCP server must include a command or URL."}

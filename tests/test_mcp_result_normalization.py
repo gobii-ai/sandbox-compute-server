@@ -22,23 +22,50 @@ class _MCPCallResult:
 
 class MCPResultNormalizationTests(unittest.TestCase):
     def test_parse_payload_injects_writable_stdio_cache_env(self):
-        runtime, error = _parse_mcp_server_payload(
-            {
-                "server": {
-                    "config_id": "cfg-1",
-                    "name": "postgres",
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-postgres"],
-                    "env": {},
+        with patch.dict("os.environ", {"SANDBOX_RUNTIME_CACHE_ROOT": "/tmp/gobii-runtime-test"}, clear=False):
+            runtime, error = _parse_mcp_server_payload(
+                {
+                    "agent_id": "agent-1",
+                    "server": {
+                        "config_id": "cfg-1",
+                        "name": "postgres",
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-postgres"],
+                        "env": {},
+                    },
                 }
-            }
-        )
+            )
         self.assertIsNone(error)
         assert runtime is not None
-        self.assertEqual(runtime["env"].get("NPM_CONFIG_CACHE"), "/workspace/.npm-cache")
-        self.assertEqual(runtime["env"].get("npm_config_cache"), "/workspace/.npm-cache")
-        self.assertEqual(runtime["env"].get("XDG_CACHE_HOME"), "/workspace/.cache")
-        self.assertEqual(runtime["env"].get("HOME"), "/workspace")
+        self.assertEqual(runtime["env"].get("NPM_CONFIG_CACHE"), "/tmp/gobii-runtime-test/agent-1/npm")
+        self.assertEqual(runtime["env"].get("npm_config_cache"), "/tmp/gobii-runtime-test/agent-1/npm")
+        self.assertEqual(runtime["env"].get("XDG_CACHE_HOME"), "/tmp/gobii-runtime-test/agent-1/xdg")
+        self.assertEqual(runtime["env"].get("HOME"), "/tmp/gobii-runtime-test/agent-1/home")
+
+    def test_parse_payload_keeps_non_workspace_cache_env(self):
+        with patch.dict("os.environ", {"SANDBOX_RUNTIME_CACHE_ROOT": "/tmp/gobii-runtime-test"}, clear=False):
+            runtime, error = _parse_mcp_server_payload(
+                {
+                    "agent_id": "agent-2",
+                    "server": {
+                        "config_id": "cfg-2",
+                        "name": "postgres",
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-postgres"],
+                        "env": {
+                            "HOME": "/opt/custom-home",
+                            "XDG_CACHE_HOME": "/opt/custom-xdg",
+                            "NPM_CONFIG_CACHE": "/opt/custom-npm",
+                        },
+                    },
+                }
+            )
+        self.assertIsNone(error)
+        assert runtime is not None
+        self.assertEqual(runtime["env"].get("HOME"), "/opt/custom-home")
+        self.assertEqual(runtime["env"].get("XDG_CACHE_HOME"), "/opt/custom-xdg")
+        self.assertEqual(runtime["env"].get("NPM_CONFIG_CACHE"), "/opt/custom-npm")
+        self.assertEqual(runtime["env"].get("npm_config_cache"), "/opt/custom-npm")
 
     def test_normalize_result_handles_nested_non_json_objects(self):
         normalized = _normalize_mcp_result(_MCPCallResult())

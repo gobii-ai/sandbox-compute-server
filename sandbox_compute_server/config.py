@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -52,6 +53,25 @@ def _sandbox_env(agent_root: Optional[Path] = None, extra_env: Optional[Dict[str
 def _workspace_root() -> Path:
     root = os.environ.get("SANDBOX_WORKSPACE_ROOT", "/workspace").strip() or "/workspace"
     return Path(root)
+
+
+def _runtime_cache_root() -> Path:
+    root = os.environ.get("SANDBOX_RUNTIME_CACHE_ROOT", "/var/tmp/gobii-runtime").strip() or "/var/tmp/gobii-runtime"
+    return Path(root)
+
+
+def _runtime_cache_paths(identity: str) -> Dict[str, Path]:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]", "_", (identity or "").strip()) or "default"
+    base = _runtime_cache_root() / cleaned
+    paths = {
+        "base": base,
+        "home": base / "home",
+        "xdg": base / "xdg",
+        "npm": base / "npm",
+    }
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return paths
 
 
 def _workspace_max_bytes() -> int:
