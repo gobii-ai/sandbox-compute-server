@@ -1,0 +1,115 @@
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from sandbox_compute_server.run import _handle_python_exec
+from sandbox_compute_server.tools import _handle_tool_request
+
+
+class PythonExecEnvTests(unittest.TestCase):
+    def test_handle_python_exec_passes_env_to_sandbox_env(self):
+        payload = {
+            "agent_id": "agent-1",
+            "code": "print('hello')",
+            "env": {"OPENAI_API_KEY": "sk-test"},
+            "trusted_env_keys": ["OPENAI_API_KEY"],
+        }
+        completed = type(
+            "CompletedProcess",
+            (),
+            {"returncode": 0, "stdout": "hello\n", "stderr": ""},
+        )()
+
+        with patch("sandbox_compute_server.run._require_agent_id", return_value=("agent-1", None)), patch(
+            "sandbox_compute_server.run._agent_workspace",
+            return_value=Path("/tmp/workspace"),
+        ), patch("sandbox_compute_server.run._store_proxy_env"), patch(
+            "sandbox_compute_server.run._normalize_timeout",
+            return_value=30,
+        ), patch(
+            "sandbox_compute_server.run._sandbox_env",
+            return_value={"PATH": "/usr/bin", "OPENAI_API_KEY": "sk-test"},
+        ) as sandbox_env_mock, patch(
+            "sandbox_compute_server.run.subprocess.run",
+            return_value=completed,
+        ) as run_mock:
+            result = _handle_python_exec(payload)
+
+        self.assertEqual(result["status"], "ok")
+        sandbox_env_mock.assert_called_once_with(
+            Path("/tmp/workspace"),
+            {"OPENAI_API_KEY": "sk-test"},
+            trusted_env_keys=["OPENAI_API_KEY"],
+        )
+        self.assertEqual(run_mock.call_args.kwargs["env"]["OPENAI_API_KEY"], "sk-test")
+
+    def test_handle_python_exec_ignores_non_dict_env(self):
+        payload = {
+            "agent_id": "agent-1",
+            "code": "print('hello')",
+            "env": "OPENAI_API_KEY=sk-test",
+        }
+        completed = type(
+            "CompletedProcess",
+            (),
+            {"returncode": 0, "stdout": "hello\n", "stderr": ""},
+        )()
+
+        with patch("sandbox_compute_server.run._require_agent_id", return_value=("agent-1", None)), patch(
+            "sandbox_compute_server.run._agent_workspace",
+            return_value=Path("/tmp/workspace"),
+        ), patch("sandbox_compute_server.run._store_proxy_env"), patch(
+            "sandbox_compute_server.run._normalize_timeout",
+            return_value=30,
+        ), patch(
+            "sandbox_compute_server.run._sandbox_env",
+            return_value={"PATH": "/usr/bin"},
+        ) as sandbox_env_mock, patch(
+            "sandbox_compute_server.run.subprocess.run",
+            return_value=completed,
+        ):
+            result = _handle_python_exec(payload)
+
+        self.assertEqual(result["status"], "ok")
+        sandbox_env_mock.assert_called_once_with(
+            Path("/tmp/workspace"),
+            None,
+            trusted_env_keys=[],
+        )
+
+    def test_tool_request_python_exec_preserves_env_payload(self):
+        payload = {
+            "agent_id": "agent-1",
+            "tool_name": "python_exec",
+            "params": {
+                "code": "print('hello')",
+                "env": {"OPENAI_API_KEY": "sk-test"},
+                "trusted_env_keys": ["OPENAI_API_KEY"],
+            },
+        }
+
+        with patch("sandbox_compute_server.tools._require_agent_id", return_value=("agent-1", None)), patch(
+            "sandbox_compute_server.tools._agent_workspace",
+            return_value=Path("/tmp/workspace"),
+        ), patch("sandbox_compute_server.tools._store_proxy_env"), patch(
+            "sandbox_compute_server.tools._trace_context",
+            return_value=(None, None),
+        ), patch(
+            "sandbox_compute_server.tools._handle_python_exec",
+            return_value={"status": "ok"},
+        ) as python_exec_mock:
+            result = _handle_tool_request(payload)
+
+        self.assertEqual(result["status"], "ok")
+        python_exec_mock.assert_called_once_with(
+            {
+                "agent_id": "agent-1",
+                "code": "print('hello')",
+                "env": {"OPENAI_API_KEY": "sk-test"},
+                "trusted_env_keys": ["OPENAI_API_KEY"],
+            }
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

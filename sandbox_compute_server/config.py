@@ -1,7 +1,7 @@
 import os
 import re
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 _DEFAULT_ALLOWED_ENV_KEYS = {
     "PATH",
@@ -35,15 +35,20 @@ def _allowed_env_keys() -> set[str]:
     return set(parts) or set(_DEFAULT_ALLOWED_ENV_KEYS)
 
 
-def _sandbox_env(agent_root: Optional[Path] = None, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def _sandbox_env(
+    agent_root: Optional[Path] = None,
+    extra_env: Optional[Dict[str, str]] = None,
+    trusted_env_keys: Optional[Sequence[str]] = None,
+) -> Dict[str, str]:
     from sandbox_compute_server.manifest import _proxy_env_from_manifest
 
     allowed = _allowed_env_keys()
+    trusted = {str(key) for key in (trusted_env_keys or []) if isinstance(key, str) and key.strip()}
     env = {key: value for key, value in os.environ.items() if key in allowed}
     env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     if extra_env:
         for key, value in extra_env.items():
-            if key in allowed or key.startswith("SANDBOX_"):
+            if key in allowed or key.startswith("SANDBOX_") or key in trusted:
                 env[key] = str(value)
     if agent_root:
         env.update(_proxy_env_from_manifest(agent_root))
