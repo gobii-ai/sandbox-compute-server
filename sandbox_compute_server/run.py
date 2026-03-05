@@ -109,6 +109,9 @@ def _handle_run_command(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         cwd = None
     env = payload.get("env") if isinstance(payload.get("env"), dict) else None
+    trusted_env_keys = payload.get("trusted_env_keys")
+    if not isinstance(trusted_env_keys, list):
+        trusted_env_keys = []
     timeout = _normalize_timeout(
         payload.get("timeout"),
         default=_run_command_timeout_seconds(),
@@ -119,7 +122,7 @@ def _handle_run_command(payload: Dict[str, Any]) -> Dict[str, Any]:
             command,
             shell=True,
             cwd=cwd or None,
-            env=_sandbox_env(agent_root, env),
+            env=_sandbox_env(agent_root, env, trusted_env_keys=trusted_env_keys),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -195,11 +198,15 @@ def _handle_python_exec(payload: Dict[str, Any]) -> Dict[str, Any]:
         default=_python_default_timeout_seconds(),
         maximum=_python_max_timeout_seconds(),
     )
+    extra_env = payload.get("env") if isinstance(payload.get("env"), dict) else None
+    trusted_env_keys = payload.get("trusted_env_keys")
+    if not isinstance(trusted_env_keys, list):
+        trusted_env_keys = []
 
     try:
         result = subprocess.run(
             [sys.executable, "-c", code],
-            env=_sandbox_env(agent_root),
+            env=_sandbox_env(agent_root, extra_env, trusted_env_keys=trusted_env_keys),
             capture_output=True,
             text=True,
             timeout=timeout,
