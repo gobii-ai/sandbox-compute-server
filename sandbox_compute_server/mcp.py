@@ -227,6 +227,24 @@ def _safe_json_log(payload: Dict[str, Any]) -> str:
         return json.dumps(_normalize_mcp_result(payload), sort_keys=True, ensure_ascii=True)
 
 
+def _prepare_runtime_proxy_env(
+    payload: Dict[str, Any], runtime: Dict[str, Any], *, skip_when_url: bool = False
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    if skip_when_url and runtime.get("url"):
+        return None, None
+
+    agent_id, error = _require_agent_id(payload)
+    if error:
+        return None, error
+
+    agent_root = _agent_workspace(agent_id)
+    _store_proxy_env(agent_root, payload)
+    proxy_env = _proxy_env_from_manifest(agent_root)
+    if proxy_env:
+        runtime["env"] = {**runtime.get("env", {}), **proxy_env}
+    return agent_id, None
+
+
 async def _call_mcp_tool(runtime: Dict[str, Any], tool_name: str, params: Dict[str, Any]) -> Any:
     if runtime.get("url"):
         transport = StreamableHttpTransport(url=runtime["url"], headers=runtime["headers"])
@@ -284,18 +302,12 @@ async def _discover_mcp_tools(runtime: Dict[str, Any]) -> list[Dict[str, Any]]:
 
 def _handle_mcp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     start = time.time()
-    agent_id, error = _require_agent_id(payload)
-    if error:
-        return error
-    agent_root = _agent_workspace(agent_id)
-    _store_proxy_env(agent_root, payload)
-
     runtime, runtime_error = _parse_mcp_server_payload(payload)
     if runtime_error:
         return runtime_error
-    proxy_env = _proxy_env_from_manifest(agent_root)
-    if proxy_env:
-        runtime["env"] = {**runtime.get("env", {}), **proxy_env}
+    agent_id, error = _prepare_runtime_proxy_env(payload, runtime)
+    if error:
+        return error
 
     tool_name = payload.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name.strip():
@@ -346,15 +358,9 @@ def _handle_discover_mcp_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
     runtime, runtime_error = _parse_mcp_server_payload(payload)
     if runtime_error:
         return runtime_error
-    if not runtime.get("url"):
-        agent_id, error = _require_agent_id(payload)
-        if error:
-            return error
-        agent_root = _agent_workspace(agent_id)
-        _store_proxy_env(agent_root, payload)
-        proxy_env = _proxy_env_from_manifest(agent_root)
-        if proxy_env:
-            runtime["env"] = {**runtime.get("env", {}), **proxy_env}
+    _agent_id, error = _prepare_runtime_proxy_env(payload, runtime, skip_when_url=True)
+    if error:
+        return error
     trace_id, _traceparent = _trace_context(payload)
     try:
         tools = asyncio.run(_discover_mcp_tools(runtime))

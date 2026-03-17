@@ -6,7 +6,7 @@ from sandbox_compute_server.workspace import _require_auth
 
 class SupervisorAuthTests(unittest.TestCase):
     def test_require_auth_fails_closed_when_token_missing(self):
-        with patch.dict("os.environ", {}, clear=False):
+        with patch.dict("os.environ", {}, clear=True):
             error = _require_auth({})
 
         self.assertEqual(error, {"status": "error", "message": "Sandbox compute API token is not configured."})

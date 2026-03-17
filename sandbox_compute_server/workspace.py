@@ -246,7 +246,7 @@ def _get_supervisor_token(environ: Dict[str, Any]) -> Optional[str]:
 
 
 def _require_auth(environ: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    token = str(os.environ.get("SANDBOX_COMPUTE_API_TOKEN", "") or "").strip()
+    token = os.environ.get("SANDBOX_COMPUTE_API_TOKEN", "").strip()
     if not token:
         return {"status": "error", "message": "Sandbox compute API token is not configured."}
     provided = _get_supervisor_token(environ)
