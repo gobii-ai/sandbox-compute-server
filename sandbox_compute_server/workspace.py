@@ -234,11 +234,22 @@ def _get_bearer_token(environ: Dict[str, Any]) -> Optional[str]:
     return parts[1].strip()
 
 
-def _require_auth(environ: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    token = os.environ.get("SANDBOX_COMPUTE_API_TOKEN", "")
-    if not token:
+def _get_supervisor_token(environ: Dict[str, Any]) -> Optional[str]:
+    bearer = _get_bearer_token(environ)
+    if bearer:
+        return bearer
+    header_token = environ.get("HTTP_X_SANDBOX_COMPUTE_TOKEN", "")
+    if not isinstance(header_token, str):
         return None
-    provided = _get_bearer_token(environ)
+    trimmed = header_token.strip()
+    return trimmed or None
+
+
+def _require_auth(environ: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    token = str(os.environ.get("SANDBOX_COMPUTE_API_TOKEN", "") or "").strip()
+    if not token:
+        return {"status": "error", "message": "Sandbox compute API token is not configured."}
+    provided = _get_supervisor_token(environ)
     if provided != token:
         return {"status": "error", "message": "Unauthorized."}
     return None
