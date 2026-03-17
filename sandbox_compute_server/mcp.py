@@ -346,6 +346,15 @@ def _handle_discover_mcp_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
     runtime, runtime_error = _parse_mcp_server_payload(payload)
     if runtime_error:
         return runtime_error
+    if not runtime.get("url"):
+        agent_id, error = _require_agent_id(payload)
+        if error:
+            return error
+        agent_root = _agent_workspace(agent_id)
+        _store_proxy_env(agent_root, payload)
+        proxy_env = _proxy_env_from_manifest(agent_root)
+        if proxy_env:
+            runtime["env"] = {**runtime.get("env", {}), **proxy_env}
     trace_id, _traceparent = _trace_context(payload)
     try:
         tools = asyncio.run(_discover_mcp_tools(runtime))
