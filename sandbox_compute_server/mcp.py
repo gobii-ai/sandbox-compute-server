@@ -13,7 +13,13 @@ from fastmcp.client.transports import StreamableHttpTransport
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from sandbox_compute_server.config import _agent_workspace, _mcp_timeout_seconds, _runtime_cache_paths, _workspace_root
+from sandbox_compute_server.config import (
+    _PROXY_ENV_KEYS,
+    _agent_workspace,
+    _mcp_timeout_seconds,
+    _runtime_cache_paths,
+    _workspace_root,
+)
 from sandbox_compute_server.manifest import _proxy_env_from_manifest, _store_proxy_env
 from sandbox_compute_server.workspace import _elapsed_ms, _require_agent_id, _trace_context
 
@@ -149,6 +155,10 @@ def _normalize_stdio_env(env: Dict[str, str], *, runtime_identity: str) -> Dict[
     return normalized
 
 
+def _proxy_env_from_process() -> Dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key in _PROXY_ENV_KEYS and value}
+
+
 def _parse_mcp_server_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     raw = payload.get("server")
     if not isinstance(raw, dict):
@@ -240,9 +250,14 @@ def _prepare_runtime_proxy_env(
     agent_root = _agent_workspace(agent_id)
     _store_proxy_env(agent_root, payload)
     if runtime.get("command"):
-        proxy_env = _proxy_env_from_manifest(agent_root)
-        if proxy_env:
-            runtime["env"] = {**runtime.get("env", {}), **proxy_env}
+        process_proxy_env = _proxy_env_from_process()
+        manifest_proxy_env = _proxy_env_from_manifest(agent_root)
+        if process_proxy_env or manifest_proxy_env:
+            runtime["env"] = {
+                **process_proxy_env,
+                **runtime.get("env", {}),
+                **manifest_proxy_env,
+            }
     return agent_id, None
 
 
