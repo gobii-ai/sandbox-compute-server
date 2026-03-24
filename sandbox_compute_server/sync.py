@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 import requests
 
 from sandbox_compute_server.config import _agent_workspace, _workspace_max_bytes
-from sandbox_compute_server.manifest import _load_manifest, _save_manifest, _store_proxy_env
+from sandbox_compute_server.manifest import _load_manifest, _proxy_env_from_manifest, _save_manifest, _store_proxy_env
 from sandbox_compute_server.workspace import (
     _checksum_bytes,
     _decode_content,
@@ -28,14 +28,37 @@ from sandbox_compute_server.workspace import (
 logger = logging.getLogger(__name__)
 
 
-def _download_file(url: str, expected_size: Optional[int]) -> bytes:
+def _requests_proxies_from_env(proxy_env: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    if not proxy_env:
+        return None
+    http_proxy = proxy_env.get("http_proxy") or proxy_env.get("HTTP_PROXY")
+    https_proxy = proxy_env.get("https_proxy") or proxy_env.get("HTTPS_PROXY") or http_proxy
+    all_proxy = proxy_env.get("all_proxy") or proxy_env.get("ALL_PROXY")
+    no_proxy = proxy_env.get("no_proxy") or proxy_env.get("NO_PROXY")
+    proxies: Dict[str, str] = {}
+    if http_proxy:
+        proxies["http"] = http_proxy
+    if https_proxy:
+        proxies["https"] = https_proxy
+    if all_proxy:
+        proxies["all"] = all_proxy
+    if no_proxy:
+        proxies["no_proxy"] = no_proxy
+    return proxies or None
+
+
+def _download_file(url: str, expected_size: Optional[int], proxy_env: Optional[Dict[str, str]] = None) -> bytes:
     started_at = time.monotonic()
     safe_url = _safe_url_for_log(url)
     max_bytes = _workspace_max_bytes()
     if expected_size and max_bytes > 0 and expected_size > max_bytes:
         raise RuntimeError("Download exceeds workspace size limit.")
     try:
-        with requests.get(url, stream=True, timeout=30) as response:
+        request_kwargs: Dict[str, Any] = {"stream": True, "timeout": 30}
+        proxies = _requests_proxies_from_env(proxy_env)
+        if proxies:
+            request_kwargs["proxies"] = proxies
+        with requests.get(url, **request_kwargs) as response:
             response.raise_for_status()
             data = bytearray()
             for chunk in response.iter_content(chunk_size=1024 * 256):
@@ -73,6 +96,7 @@ def _handle_sync_filespace(payload: Dict[str, Any]) -> Dict[str, Any]:
     direction = direction.strip().lower()
     agent_root = _agent_workspace(agent_id)
     proxy_env_updated = _store_proxy_env(agent_root, payload)
+    proxy_env = _proxy_env_from_manifest(agent_root)
     manifest_load_started = time.monotonic()
     manifest = _load_manifest(agent_root)
     manifest_load_ms = _elapsed_ms(manifest_load_started)
