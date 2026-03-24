@@ -12,16 +12,24 @@ _DEFAULT_ALLOWED_ENV_KEYS = {
     "LC_CTYPE",
     "TMPDIR",
     "TERM",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "PYTHONUNBUFFERED",
     "PYTHONIOENCODING",
 }
 
-_PROXY_ENV_KEYS = {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
+_PROXY_ENV_KEYS = {
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "FTP_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "ftp_proxy",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+}
 _TRACEPARENT_HEADER = "HTTP_TRACEPARENT"
 _TRACE_ID_HEX_LEN = 32
 _TRACEPARENT_PARTS = 4
@@ -40,8 +48,6 @@ def _sandbox_env(
     extra_env: Optional[Dict[str, str]] = None,
     trusted_env_keys: Optional[Sequence[str]] = None,
 ) -> Dict[str, str]:
-    from sandbox_compute_server.manifest import _proxy_env_from_manifest
-
     allowed = _allowed_env_keys()
     trusted = {str(key) for key in (trusted_env_keys or []) if isinstance(key, str) and key.strip()}
     env = {key: value for key, value in os.environ.items() if key in allowed}
@@ -50,8 +56,6 @@ def _sandbox_env(
         for key, value in extra_env.items():
             if key in allowed or key.startswith("SANDBOX_") or key in trusted:
                 env[key] = str(value)
-    if agent_root:
-        env.update(_proxy_env_from_manifest(agent_root))
     return env
 
 

@@ -7,6 +7,23 @@ from sandbox_compute_server.tools import _handle_tool_request
 
 
 class PythonExecEnvTests(unittest.TestCase):
+    def test_sandbox_env_does_not_merge_proxy_vars_from_environment(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "PATH": "/usr/bin",
+                "HTTP_PROXY": "http://proxy.internal:3128",
+                "HTTPS_PROXY": "http://proxy.internal:3128",
+                "NO_PROXY": "localhost,127.0.0.1",
+            },
+            clear=True,
+        ):
+            from sandbox_compute_server.config import _sandbox_env
+
+            env = _sandbox_env(Path("/tmp/workspace"))
+
+        self.assertEqual(env, {"PATH": "/usr/bin"})
+
     def test_handle_python_exec_passes_env_to_sandbox_env(self):
         payload = {
             "agent_id": "agent-1",
@@ -42,6 +59,39 @@ class PythonExecEnvTests(unittest.TestCase):
             trusted_env_keys=["OPENAI_API_KEY"],
         )
         self.assertEqual(run_mock.call_args.kwargs["env"]["OPENAI_API_KEY"], "sk-test")
+
+    def test_handle_python_exec_merges_proxy_env_from_manifest(self):
+        payload = {
+            "agent_id": "agent-1",
+            "code": "print('hello')",
+        }
+        completed = type(
+            "CompletedProcess",
+            (),
+            {"returncode": 0, "stdout": "hello\n", "stderr": ""},
+        )()
+
+        with patch("sandbox_compute_server.run._require_agent_id", return_value=("agent-1", None)), patch(
+            "sandbox_compute_server.run._agent_workspace",
+            return_value=Path("/tmp/workspace"),
+        ), patch("sandbox_compute_server.run._store_proxy_env"), patch(
+            "sandbox_compute_server.run._proxy_env_from_manifest",
+            return_value={"HTTP_PROXY": "http://proxy.internal:3128", "http_proxy": "http://proxy.internal:3128"},
+        ), patch(
+            "sandbox_compute_server.run._normalize_timeout",
+            return_value=30,
+        ), patch(
+            "sandbox_compute_server.run._sandbox_env",
+            return_value={"PATH": "/usr/bin"},
+        ), patch(
+            "sandbox_compute_server.run.subprocess.run",
+            return_value=completed,
+        ) as run_mock:
+            result = _handle_python_exec(payload)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(run_mock.call_args.kwargs["env"]["HTTP_PROXY"], "http://proxy.internal:3128")
+        self.assertEqual(run_mock.call_args.kwargs["env"]["http_proxy"], "http://proxy.internal:3128")
 
     def test_handle_python_exec_ignores_non_dict_env(self):
         payload = {

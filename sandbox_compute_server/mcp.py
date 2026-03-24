@@ -239,9 +239,10 @@ def _prepare_runtime_proxy_env(
 
     agent_root = _agent_workspace(agent_id)
     _store_proxy_env(agent_root, payload)
-    proxy_env = _proxy_env_from_manifest(agent_root)
-    if proxy_env:
-        runtime["env"] = {**runtime.get("env", {}), **proxy_env}
+    if runtime.get("command"):
+        proxy_env = _proxy_env_from_manifest(agent_root)
+        if proxy_env:
+            runtime["env"] = {**runtime.get("env", {}), **proxy_env}
     return agent_id, None
 
 

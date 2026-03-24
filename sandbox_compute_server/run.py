@@ -14,7 +14,7 @@ from sandbox_compute_server.config import (
     _sandbox_env,
     _stdio_max_bytes,
 )
-from sandbox_compute_server.manifest import _store_proxy_env
+from sandbox_compute_server.manifest import _proxy_env_from_manifest, _store_proxy_env
 from sandbox_compute_server.workspace import (
     _elapsed_ms,
     _normalize_workspace_path,
@@ -24,6 +24,19 @@ from sandbox_compute_server.workspace import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sandbox_env_with_proxy_manifest(
+    agent_root,
+    extra_env: Optional[Dict[str, str]] = None,
+    *,
+    trusted_env_keys: Optional[list[str]] = None,
+) -> Dict[str, str]:
+    env = _sandbox_env(agent_root, extra_env, trusted_env_keys=trusted_env_keys)
+    proxy_env = _proxy_env_from_manifest(agent_root)
+    if proxy_env:
+        env.update(proxy_env)
+    return env
 
 
 def _truncate_streams(stdout: str, stderr: str) -> Tuple[str, str]:
@@ -122,7 +135,7 @@ def _handle_run_command(payload: Dict[str, Any]) -> Dict[str, Any]:
             command,
             shell=True,
             cwd=cwd or None,
-            env=_sandbox_env(agent_root, env, trusted_env_keys=trusted_env_keys),
+            env=_sandbox_env_with_proxy_manifest(agent_root, env, trusted_env_keys=trusted_env_keys),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -206,7 +219,7 @@ def _handle_python_exec(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         result = subprocess.run(
             [sys.executable, "-c", code],
-            env=_sandbox_env(agent_root, extra_env, trusted_env_keys=trusted_env_keys),
+            env=_sandbox_env_with_proxy_manifest(agent_root, extra_env, trusted_env_keys=trusted_env_keys),
             capture_output=True,
             text=True,
             timeout=timeout,
