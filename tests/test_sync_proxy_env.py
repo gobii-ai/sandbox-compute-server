@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sandbox_compute_server.sync import _download_file, _handle_sync_filespace
@@ -47,7 +48,7 @@ class SyncProxyEnvTests(unittest.TestCase):
         payload = {
             "agent_id": "agent-1",
             "direction": "pull",
-            "entries": [
+            "files": [
                 {
                     "path": "/data.txt",
                     "download_url": "https://example.com/data.txt",
@@ -59,7 +60,7 @@ class SyncProxyEnvTests(unittest.TestCase):
             "proxy_env": {"HTTP_PROXY": "socks5://proxy.internal:1080"},
         }
 
-        with patch("sandbox_compute_server.sync._agent_workspace", return_value=Path("/tmp/workspace")), patch(
+        with patch("sandbox_compute_server.sync._agent_workspace", return_value=Path("/private/tmp/workspace")), patch(
             "sandbox_compute_server.sync._store_proxy_env",
             return_value=True,
         ), patch(
@@ -69,16 +70,19 @@ class SyncProxyEnvTests(unittest.TestCase):
             "sandbox_compute_server.sync._load_manifest",
             return_value={"files": {}, "deleted": {}},
         ), patch(
-            "pathlib.Path.exists",
-            return_value=False,
+            "sandbox_compute_server.sync._decode_content",
+            return_value=None,
         ), patch(
             "sandbox_compute_server.sync._download_file",
             return_value=b"hello",
         ) as download_mock, patch(
             "pathlib.Path.mkdir"
         ), patch(
-            "pathlib.Path.write_bytes",
-            return_value=5,
+            "pathlib.Path.stat",
+            return_value=SimpleNamespace(st_mtime=123.0, st_size=5),
+        ), patch(
+            "builtins.open",
+            create=True,
         ), patch(
             "sandbox_compute_server.sync._save_manifest"
         ):
