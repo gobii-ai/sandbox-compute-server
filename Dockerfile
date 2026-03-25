@@ -13,6 +13,14 @@ RUN --mount=type=cache,target=/var/cache/apt \
         git \
         procps \
         curl \
+        ripgrep \
+        jq \
+        less \
+        unzip \
+        zip \
+        file \
+        fd-find \
+        tree \
         ca-certificates \
         gnupg \
         libpango-1.0-0 \
