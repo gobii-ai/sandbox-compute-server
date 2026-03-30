@@ -11,6 +11,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update && \
     apt-get install --no-install-recommends -y \
         git \
+        uv \
         procps \
         curl \
         ripgrep \
