@@ -11,7 +11,6 @@ RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update && \
     apt-get install --no-install-recommends -y \
         git \
-        uv \
         procps \
         curl \
         ripgrep \
@@ -36,7 +35,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     apt-get install --no-install-recommends -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip
+RUN pip install --upgrade pip uv
 
 COPY pyproject.toml README.md ./
 COPY sandbox_compute_server ./sandbox_compute_server
